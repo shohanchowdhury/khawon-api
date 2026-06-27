@@ -36,6 +36,11 @@ class FoodTypeOut(BaseModel):
 
     model_config = {"from_attributes": True}
 
+class FoodTypePopularOut(FoodTypeOut):
+    restaurant_count: int = 0
+    review_count: int = 0
+    average_rating: Optional[float] = None
+
 
 # ── Restaurants ─────────────────────────────────────────────
 

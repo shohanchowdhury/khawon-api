@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from auth import get_current_user
 from database import get_db
@@ -13,6 +14,44 @@ router = APIRouter(prefix="/food-types", tags=["Food Types"])
 def list_food_types(db: Session = Depends(get_db)):
     """Get all food types (e.g. Ramen, Biriyani, Burger)"""
     return db.query(models.FoodType).order_by(models.FoodType.name).all()
+
+
+@router.get("/top", response_model=list[schemas.FoodTypePopularOut])
+def get_top_food_types(
+    limit: int = Query(8, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    """Top food types ranked by review count, then average rating."""
+    food_types = db.query(models.FoodType).all()
+    results = []
+
+    for ft in food_types:
+        restaurant_count = (
+            db.query(models.RestaurantFoodType)
+            .filter(models.RestaurantFoodType.food_type_id == ft.id)
+            .count()
+        )
+        agg = (
+            db.query(func.avg(models.Review.rating), func.count(models.Review.id))
+            .filter(models.Review.food_type_id == ft.id)
+            .first()
+        )
+        avg_rating = round(float(agg[0]), 1) if agg[0] else None
+        review_count = agg[1] or 0
+
+        results.append(schemas.FoodTypePopularOut(
+            id=ft.id,
+            name=ft.name,
+            description=ft.description,
+            restaurant_count=restaurant_count,
+            review_count=review_count,
+            average_rating=avg_rating,
+        ))
+
+    results.sort(
+        key=lambda x: (-x.review_count, -(x.average_rating or 0), x.name.lower())
+    )
+    return results[:limit]
 
 
 @router.get("/{food_type_id}", response_model=schemas.FoodTypeOut)
