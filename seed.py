@@ -5,8 +5,20 @@ import models
 
 SAMPLE_FOOD_TYPES = [
     {"name": "Biriyani", "description": "Fragrant spiced rice with meat"},
+    {"name": "Kacchi Biriyani", "description": "Slow-cooked mutton biriyani in dum style"},
     {"name": "Ramen", "description": "Japanese noodle soup"},
     {"name": "Fuchka", "description": "Crispy shells with tangy tamarind water"},
+    {"name": "Chotpoti", "description": "Spiced chickpeas and potatoes with tamarind"},
+    {"name": "Haleem", "description": "Slow-cooked lentil and meat stew"},
+    {"name": "Khichuri", "description": "Comfort rice and lentil one-pot dish"},
+    {"name": "Beef Tehari", "description": "Spiced rice cooked with beef"},
+    {"name": "Paratha", "description": "Flaky layered flatbread, often with egg or keema"},
+    {"name": "Shawarma", "description": "Wrapped grilled meat with sauce and salad"},
+    {"name": "Burger", "description": "Classic beef or chicken burgers"},
+    {"name": "Pizza", "description": "Wood-fired or pan pizza slices and pies"},
+    {"name": "Kebab", "description": "Grilled skewered meat, seekh or shami style"},
+    {"name": "Mishti Doi", "description": "Sweet fermented yogurt dessert"},
+    {"name": "Pitha", "description": "Traditional rice cakes and winter sweets"},
 ]
 
 SAMPLE_RESTAURANTS = [
@@ -43,21 +55,38 @@ SAMPLE_REVIEWS = [
 ]
 
 
+def seed_food_types(db):
+    added = 0
+    for ft_data in SAMPLE_FOOD_TYPES:
+        existing = db.query(models.FoodType).filter(
+            models.FoodType.name.ilike(ft_data["name"])
+        ).first()
+        if existing:
+            continue
+        db.add(models.FoodType(**ft_data))
+        added += 1
+    db.commit()
+    return added
+
+
 def seed():
     models.Base.metadata.create_all(bind=engine)
     db = SessionLocal()
 
     try:
-        if db.query(models.FoodType).count() > 0:
-            print("Database already has data — skipping seed.")
+        added = seed_food_types(db)
+        if added:
+            print(f"Added {added} food type(s).")
+        else:
+            print("All sample food types already exist.")
+
+        if db.query(models.Restaurant).count() > 0:
             return
 
-        food_type_map = {}
-        for ft_data in SAMPLE_FOOD_TYPES:
-            ft = models.FoodType(**ft_data)
-            db.add(ft)
-            db.flush()
-            food_type_map[ft.name] = ft.id
+        food_type_map = {
+            ft.name: ft.id
+            for ft in db.query(models.FoodType).all()
+        }
 
         restaurant_map = {}
         for r_data in SAMPLE_RESTAURANTS:
@@ -85,7 +114,7 @@ def seed():
             db.add(review)
 
         db.commit()
-        print("Seeded food types, restaurants, and reviews.")
+        print("Seeded restaurants and reviews.")
     finally:
         db.close()
 
