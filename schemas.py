@@ -33,6 +33,7 @@ class FoodTypeOut(BaseModel):
     id: int
     name: str
     description: Optional[str]
+    image_url: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

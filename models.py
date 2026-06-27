@@ -25,6 +25,7 @@ class FoodType(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False, unique=True)
     description = Column(Text, nullable=True)
+    image_url = Column(Text, nullable=True)
 
     restaurant_links = relationship("RestaurantFoodType", back_populates="food_type")
 

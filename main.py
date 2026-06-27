@@ -17,6 +17,14 @@ def run_migrations():
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE reviews ADD COLUMN user_id INTEGER"))
 
+    if "food_types" in inspector.get_table_names():
+        ft_columns = {col["name"] for col in inspector.get_columns("food_types")}
+        if "image_url" not in ft_columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE food_types ADD COLUMN IF NOT EXISTS image_url TEXT")
+                )
+
 
 run_migrations()
 models.Base.metadata.create_all(bind=engine)

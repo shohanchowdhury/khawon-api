@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -6,6 +6,7 @@ from auth import get_current_user
 from database import get_db
 import models
 import schemas
+from storage import upload_food_image
 
 router = APIRouter(prefix="/food-types", tags=["Food Types"])
 
@@ -28,6 +29,7 @@ def _enrich_food_type(ft: models.FoodType, db: Session) -> schemas.FoodTypePopul
         id=ft.id,
         name=ft.name,
         description=ft.description,
+        image_url=ft.image_url,
         restaurant_count=restaurant_count,
         review_count=review_count,
         average_rating=avg_rating,
@@ -75,19 +77,29 @@ def get_food_type(food_type_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/", response_model=schemas.FoodTypeOut, status_code=201)
-def create_food_type(
-    data: schemas.FoodTypeCreate,
+async def create_food_type(
+    name: str = Form(...),
+    description: str | None = Form(None),
+    image: UploadFile | None = File(None),
     db: Session = Depends(get_db),
     _current_user: models.User = Depends(get_current_user),
 ):
-    """Add a new food type (requires sign-in)"""
+    """Add a new food type (requires sign-in). Optional image upload."""
     existing = db.query(models.FoodType).filter(
-        models.FoodType.name.ilike(data.name)
+        models.FoodType.name.ilike(name)
     ).first()
     if existing:
-        raise HTTPException(status_code=400, detail=f"Food type '{data.name}' already exists")
+        raise HTTPException(status_code=400, detail=f"Food type '{name}' already exists")
 
-    ft = models.FoodType(**data.model_dump())
+    image_url = None
+    if image and image.filename:
+        image_url = await upload_food_image(image)
+
+    ft = models.FoodType(
+        name=name,
+        description=description or None,
+        image_url=image_url,
+    )
     db.add(ft)
     db.commit()
     db.refresh(ft)
