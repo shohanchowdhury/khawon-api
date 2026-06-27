@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+
+from auth import get_current_user
 from database import get_db
 import models
 import schemas
@@ -22,8 +24,12 @@ def get_food_type(food_type_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/", response_model=schemas.FoodTypeOut, status_code=201)
-def create_food_type(data: schemas.FoodTypeCreate, db: Session = Depends(get_db)):
-    """Add a new food type (admin use)"""
+def create_food_type(
+    data: schemas.FoodTypeCreate,
+    db: Session = Depends(get_db),
+    _current_user: models.User = Depends(get_current_user),
+):
+    """Add a new food type (requires sign-in)"""
     existing = db.query(models.FoodType).filter(
         models.FoodType.name.ilike(data.name)
     ).first()

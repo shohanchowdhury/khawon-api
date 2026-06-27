@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from auth import get_current_user
 from database import get_db
 import models
 import schemas
@@ -49,8 +50,12 @@ def get_restaurant(restaurant_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/", response_model=schemas.RestaurantOut, status_code=201)
-def create_restaurant(data: schemas.RestaurantCreate, db: Session = Depends(get_db)):
-    """Add a new restaurant with its food types (admin use)"""
+def create_restaurant(
+    data: schemas.RestaurantCreate,
+    db: Session = Depends(get_db),
+    _current_user: models.User = Depends(get_current_user),
+):
+    """Add a new restaurant with its food types (requires sign-in)"""
     restaurant = models.Restaurant(
         name=data.name,
         area=data.area,

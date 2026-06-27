@@ -1,6 +1,26 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
 from datetime import datetime
+
+
+# ── Users ────────────────────────────────────────────────────
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6, max_length=128)
+
+class UserOut(BaseModel):
+    id: int
+    email: EmailStr
+    username: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 
 # ── Food Types ──────────────────────────────────────────────
@@ -46,7 +66,6 @@ class RestaurantOut(BaseModel):
 class ReviewCreate(BaseModel):
     restaurant_id: int
     food_type_id: int
-    reviewer_name: Optional[str] = "Anonymous"
     rating: int = Field(..., ge=1, le=5)
     comment: Optional[str] = None
 
