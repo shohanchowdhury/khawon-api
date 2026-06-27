@@ -39,6 +39,9 @@ class Restaurant(Base):
     address = Column(Text, nullable=True)
     phone = Column(String(30), nullable=True)
     google_maps_url = Column(Text, nullable=True)
+    website_url = Column(Text, nullable=True)
+    google_place_id = Column(String(255), nullable=True)
+    image_url = Column(Text, nullable=True)
 
     food_type_links = relationship("RestaurantFoodType", back_populates="restaurant")
     reviews = relationship("Review", back_populates="restaurant")

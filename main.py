@@ -4,7 +4,7 @@ from sqlalchemy import inspect, text
 from database import engine
 import models
 
-from routers import auth, food_types, restaurants, reviews, search
+from routers import auth, food_images, food_types, places, restaurants, reviews, search
 
 
 def run_migrations():
@@ -23,6 +23,26 @@ def run_migrations():
             with engine.begin() as conn:
                 conn.execute(
                     text("ALTER TABLE food_types ADD COLUMN IF NOT EXISTS image_url TEXT")
+                )
+
+    if "restaurants" in inspector.get_table_names():
+        rest_columns = {col["name"] for col in inspector.get_columns("restaurants")}
+        if "website_url" not in rest_columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS website_url TEXT")
+                )
+        if "google_place_id" not in rest_columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS google_place_id VARCHAR(255)"
+                    )
+                )
+        if "image_url" not in rest_columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS image_url TEXT")
                 )
 
 
@@ -47,6 +67,8 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(search.router)
 app.include_router(food_types.router)
+app.include_router(food_images.router)
+app.include_router(places.router)
 app.include_router(restaurants.router)
 app.include_router(reviews.router)
 

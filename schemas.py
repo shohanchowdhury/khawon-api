@@ -43,6 +43,19 @@ class FoodTypePopularOut(FoodTypeOut):
     average_rating: Optional[float] = None
 
 
+class FoodImageSearchResult(BaseModel):
+    id: str
+    image_url: str
+    thumbnail_url: str
+    title: Optional[str] = None
+    source_url: Optional[str] = None
+
+
+class FoodImageSearchResponse(BaseModel):
+    photos: list[FoodImageSearchResult] = []
+    search_help: Optional[str] = None
+
+
 # ── Restaurants ─────────────────────────────────────────────
 
 class RestaurantCreate(BaseModel):
@@ -51,6 +64,9 @@ class RestaurantCreate(BaseModel):
     address: Optional[str] = None
     phone: Optional[str] = None
     google_maps_url: Optional[str] = None
+    website_url: Optional[str] = None
+    google_place_id: Optional[str] = None
+    google_photo_name: Optional[str] = None
     food_type_ids: list[int] = []   # which food types this restaurant serves
 
 class RestaurantOut(BaseModel):
@@ -60,11 +76,33 @@ class RestaurantOut(BaseModel):
     address: Optional[str]
     phone: Optional[str]
     google_maps_url: Optional[str]
+    website_url: Optional[str] = None
+    google_place_id: Optional[str] = None
+    image_url: Optional[str] = None
     food_types: list[FoodTypeOut] = []
     average_rating: Optional[float] = None
     review_count: int = 0
 
     model_config = {"from_attributes": True}
+
+
+class PlacePhotoOut(BaseModel):
+    name: str
+    width_px: Optional[int] = None
+    height_px: Optional[int] = None
+    attribution: Optional[str] = None
+
+
+class PlaceSearchResult(BaseModel):
+    place_id: str
+    name: str
+    address: Optional[str] = None
+    area: Optional[str] = None
+    phone: Optional[str] = None
+    google_maps_url: Optional[str] = None
+    website_url: Optional[str] = None
+    photos: list[PlacePhotoOut] = []
+    photos_help: Optional[str] = None
 
 
 # ── Reviews ─────────────────────────────────────────────────
