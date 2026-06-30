@@ -5,6 +5,7 @@ from sqlalchemy import func
 
 from auth import get_current_user
 from database import get_db
+from food_detail import build_food_detail
 import models
 import schemas
 from food_images import pop_cached_image
@@ -104,6 +105,15 @@ def get_food_catalogue(
         query = query.filter(models.FoodType.name.ilike(f"%{q}%"))
     food_types = query.order_by(models.FoodType.name).all()
     return _enrich_food_types(food_types, db)
+
+
+@router.get("/{food_type_id}/detail", response_model=schemas.FoodDetailResult)
+def get_food_type_detail(food_type_id: int, db: Session = Depends(get_db)):
+    """Food type with stats and restaurants serving it, sorted by rating."""
+    ft = db.query(models.FoodType).filter(models.FoodType.id == food_type_id).first()
+    if not ft:
+        raise HTTPException(status_code=404, detail="Food type not found")
+    return build_food_detail(db, ft)
 
 
 @router.get("/{food_type_id}", response_model=schemas.FoodTypeOut)

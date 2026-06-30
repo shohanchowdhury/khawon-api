@@ -130,3 +130,8 @@ class ReviewOut(BaseModel):
 class SearchResult(BaseModel):
     food_type: FoodTypeOut
     restaurants: list[RestaurantOut]
+
+
+class FoodDetailResult(BaseModel):
+    food_type: FoodTypePopularOut
+    restaurants: list[RestaurantOut]
