@@ -66,6 +66,7 @@ def _enrich_food_types(
                 name=ft.name,
                 description=ft.description,
                 image_url=ft.image_url,
+                taste_tags=ft.taste_tags,
                 restaurant_count=restaurant_counts.get(ft.id, 0),
                 review_count=review_count or 0,
                 average_rating=avg_rating,

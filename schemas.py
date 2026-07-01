@@ -34,6 +34,7 @@ class FoodTypeOut(BaseModel):
     name: str
     description: Optional[str]
     image_url: Optional[str] = None
+    taste_tags: Optional[list[str]] = None
 
     model_config = {"from_attributes": True}
 

@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Text, ForeignKey,
-    DateTime, CheckConstraint
+    DateTime, CheckConstraint, JSON
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -26,6 +26,7 @@ class FoodType(Base):
     name = Column(String(100), nullable=False, unique=True)
     description = Column(Text, nullable=True)
     image_url = Column(Text, nullable=True)
+    taste_tags = Column(JSON, nullable=True)
 
     restaurant_links = relationship("RestaurantFoodType", back_populates="food_type")
 

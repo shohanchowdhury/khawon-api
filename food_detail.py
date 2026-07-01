@@ -29,6 +29,7 @@ def enrich_food_type(db: Session, food_type: models.FoodType) -> schemas.FoodTyp
         name=food_type.name,
         description=food_type.description,
         image_url=food_type.image_url,
+        taste_tags=food_type.taste_tags,
         restaurant_count=restaurant_count,
         review_count=review_count or 0,
         average_rating=avg_rating,
