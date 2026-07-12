@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
+from dish_detail import review_to_out
 import models
 import schemas
 
@@ -15,41 +16,25 @@ def submit_review(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Submit a review for a restaurant (requires sign-in)"""
-    restaurant = db.query(models.Restaurant).filter(
-        models.Restaurant.id == data.restaurant_id
-    ).first()
-    if not restaurant:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+    """Review a dish (requires sign-in). The restaurant is derived through the
+    dish. One review per user per dish - submitting again updates your review."""
+    dish = db.query(models.Dish).filter(models.Dish.id == data.dish_id).first()
+    if not dish:
+        raise HTTPException(status_code=404, detail="Dish not found")
 
-    food_type = db.query(models.FoodType).filter(
-        models.FoodType.id == data.food_type_id
+    review = db.query(models.Review).filter(
+        models.Review.user_id == current_user.id,
+        models.Review.dish_id == data.dish_id,
     ).first()
-    if not food_type:
-        raise HTTPException(status_code=404, detail="Food type not found")
+    if review is None:
+        review = models.Review(dish_id=data.dish_id, user_id=current_user.id)
+        db.add(review)
+    review.rating = data.rating
+    review.comment = data.comment
 
-    link = db.query(models.RestaurantFoodType).filter(
-        models.RestaurantFoodType.restaurant_id == data.restaurant_id,
-        models.RestaurantFoodType.food_type_id == data.food_type_id,
-    ).first()
-    if not link:
-        raise HTTPException(
-            status_code=400,
-            detail=f"'{restaurant.name}' does not serve '{food_type.name}'",
-        )
-
-    review = models.Review(
-        restaurant_id=data.restaurant_id,
-        food_type_id=data.food_type_id,
-        user_id=current_user.id,
-        reviewer_name=current_user.username,
-        rating=data.rating,
-        comment=data.comment,
-    )
-    db.add(review)
     db.commit()
     db.refresh(review)
-    return review
+    return review_to_out(review)
 
 
 @router.delete("/{review_id}", status_code=204)

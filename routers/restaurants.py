@@ -9,7 +9,7 @@ from database import get_db
 import models
 import schemas
 from places import fetch_place_photo_bytes
-from dish_detail import get_dishes_for_restaurant
+from dish_detail import get_dishes_for_restaurant, get_reviews_for_restaurant
 from storage import upload_image_bytes
 
 router = APIRouter(prefix="/restaurants", tags=["Restaurants"])
@@ -23,29 +23,31 @@ def _enrich_restaurants(
 
     ids = [r.id for r in restaurants]
 
+    # A restaurant's rating = the ratings of its dishes' reviews (reviews are
+    # dish-anchored; the restaurant link flows through the dish).
     review_stats = {
         row[0]: (row[1], row[2])
         for row in db.query(
-            models.Review.restaurant_id,
+            models.Dish.restaurant_id,
             func.avg(models.Review.rating),
             func.count(models.Review.id),
         )
-        .filter(models.Review.restaurant_id.in_(ids))
-        .group_by(models.Review.restaurant_id)
+        .join(models.Review, models.Review.dish_id == models.Dish.id)
+        .filter(models.Dish.restaurant_id.in_(ids))
+        .group_by(models.Dish.restaurant_id)
         .all()
     }
 
-    links = (
-        db.query(models.RestaurantFoodType)
-        .filter(models.RestaurantFoodType.restaurant_id.in_(ids))
-        .options(joinedload(models.RestaurantFoodType.food_type))
-        .all()
-    )
+    # A restaurant's food types are derived from its dishes' classifications.
     food_types_by_restaurant: dict[int, list[models.FoodType]] = {}
-    for link in links:
-        food_types_by_restaurant.setdefault(link.restaurant_id, []).append(
-            link.food_type
-        )
+    for restaurant_id, food_type in (
+        db.query(models.Dish.restaurant_id, models.FoodType)
+        .join(models.FoodType, models.Dish.food_type_id == models.FoodType.id)
+        .filter(models.Dish.restaurant_id.in_(ids), models.Dish.is_active.is_(True))
+        .distinct()
+        .all()
+    ):
+        food_types_by_restaurant.setdefault(restaurant_id, []).append(food_type)
 
     results = []
     for r in restaurants:
@@ -78,16 +80,6 @@ def _enrich(restaurant: models.Restaurant, db: Session) -> schemas.RestaurantOut
     return _enrich_restaurants([restaurant], db)[0]
 
 
-def _parse_food_type_ids(raw: str) -> list[int]:
-    try:
-        ids = json.loads(raw or "[]")
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="Invalid food_type_ids JSON.") from exc
-    if not isinstance(ids, list):
-        raise HTTPException(status_code=400, detail="food_type_ids must be a JSON array.")
-    return [int(value) for value in ids]
-
-
 async def _resolve_restaurant_image(
     google_photo_name: str | None,
     image: UploadFile | None,
@@ -99,24 +91,6 @@ async def _resolve_restaurant_image(
         photo_bytes, _ = fetch_place_photo_bytes(google_photo_name.strip(), max_width=1600)
         return upload_image_bytes(photo_bytes, folder="khawon/restaurants")
     return None
-
-
-def _set_food_type_links(
-    restaurant_id: int, food_type_ids: list[int], db: Session
-) -> None:
-    db.query(models.RestaurantFoodType).filter(
-        models.RestaurantFoodType.restaurant_id == restaurant_id
-    ).delete()
-
-    for ft_id in food_type_ids:
-        ft = db.query(models.FoodType).filter(models.FoodType.id == ft_id).first()
-        if not ft:
-            raise HTTPException(status_code=400, detail=f"Food type ID {ft_id} not found")
-        db.add(
-            models.RestaurantFoodType(
-                restaurant_id=restaurant_id, food_type_id=ft_id
-            )
-        )
 
 
 @router.get("/", response_model=list[schemas.RestaurantOut])
@@ -164,12 +138,12 @@ async def create_restaurant(
     website_url: str | None = Form(None),
     google_place_id: str | None = Form(None),
     google_photo_name: str | None = Form(None),
-    food_type_ids: str = Form("[]"),
     image: UploadFile | None = File(None),
     db: Session = Depends(get_db),
     _current_user: models.User = Depends(get_current_user),
 ):
-    """Add a new restaurant with its food types (requires sign-in)."""
+    """Add a new restaurant (requires sign-in). Food types are derived from
+    the restaurant's dishes, not set directly."""
     image_url = await _resolve_restaurant_image(google_photo_name, image)
 
     restaurant = models.Restaurant(
@@ -183,10 +157,6 @@ async def create_restaurant(
         image_url=image_url,
     )
     db.add(restaurant)
-    db.flush()
-
-    _set_food_type_links(restaurant.id, _parse_food_type_ids(food_type_ids), db)
-
     db.commit()
     db.refresh(restaurant)
     return _enrich(restaurant, db)
@@ -203,7 +173,6 @@ async def update_restaurant(
     website_url: str | None = Form(None),
     google_place_id: str | None = Form(None),
     google_photo_name: str | None = Form(None),
-    food_type_ids: str = Form("[]"),
     image: UploadFile | None = File(None),
     db: Session = Depends(get_db),
     _current_user: models.User = Depends(get_current_user),
@@ -223,8 +192,6 @@ async def update_restaurant(
     new_image_url = await _resolve_restaurant_image(google_photo_name, image)
     if new_image_url:
         r.image_url = new_image_url
-
-    _set_food_type_links(restaurant_id, _parse_food_type_ids(food_type_ids), db)
 
     db.commit()
     db.refresh(r)
@@ -284,6 +251,4 @@ def get_restaurant_reviews(restaurant_id: int, db: Session = Depends(get_db)):
     r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Restaurant not found")
-    return db.query(models.Review).filter(
-        models.Review.restaurant_id == restaurant_id
-    ).order_by(models.Review.created_at.desc()).all()
+    return get_reviews_for_restaurant(db, restaurant_id)

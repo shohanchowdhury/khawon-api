@@ -34,7 +34,7 @@ class FoodTypeOut(BaseModel):
     name: str
     description: Optional[str]
     image_url: Optional[str] = None
-    taste_tags: Optional[list[str]] = None
+    parent_id: Optional[int] = None
 
     model_config = {"from_attributes": True}
 
@@ -84,7 +84,6 @@ class RestaurantCreate(BaseModel):
     website_url: Optional[str] = None
     google_place_id: Optional[str] = None
     google_photo_name: Optional[str] = None
-    food_type_ids: list[int] = []   # which food types this restaurant serves
 
     # Scrape-sourced fields (all optional — populated by the data pipeline loader, not the admin form)
     match_status: Optional[str] = None
@@ -189,9 +188,11 @@ class DishOut(BaseModel):
     price_bdt: Optional[float] = None
     image_url: Optional[str] = None
     is_sold_out: bool = False
+    is_active: bool = True
     category_raw: Optional[str] = None
     variations: Optional[list[DishVariationOut]] = None
     food_type: Optional[FoodTypeOut] = None
+    canonical_dish_id: Optional[int] = None
     cuisines: list[CuisineOut] = []
     flavor_tags: list[FlavorTagOut] = []
     restaurant: RestaurantSummaryOut
@@ -205,24 +206,49 @@ class RestaurantWithDishesOut(RestaurantOut):
     dishes: list[DishOut] = []
 
 
+# ── Canonical dishes (the unit of cross-restaurant comparison) ──
+
+class CanonicalDishOut(BaseModel):
+    id: int
+    name: str
+    food_type: Optional[FoodTypeOut] = None
+    aliases: Optional[list[str]] = None
+    image_url: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class CanonicalDishMatch(CanonicalDishOut):
+    """A canonical dish surfaced by search, with comparison stats."""
+    restaurant_count: int = 0
+    dish_count: int = 0
+    average_rating: Optional[float] = None
+    min_price_bdt: Optional[float] = None
+    max_price_bdt: Optional[float] = None
+
+
+class DishCompareResult(BaseModel):
+    """One canonical dish compared across every restaurant serving it."""
+    canonical_dish: CanonicalDishOut
+    dishes: list[DishOut]
+
+
 # ── Reviews ─────────────────────────────────────────────────
 
 class ReviewCreate(BaseModel):
-    restaurant_id: int
-    food_type_id: int
-    dish_id: Optional[int] = None
+    dish_id: int
     rating: int = Field(..., ge=1, le=5)
     comment: Optional[str] = None
 
 class ReviewOut(BaseModel):
     id: int
-    restaurant_id: int
-    food_type_id: int
-    dish_id: Optional[int] = None
-    reviewer_name: Optional[str]
+    dish_id: int
+    restaurant_id: int          # derived through the dish
+    dish_name: Optional[str] = None
+    username: str               # from the user account; accounts are required
     rating: int
     comment: Optional[str]
-    source: str = "user"
+    is_verified: bool = False
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -230,17 +256,14 @@ class ReviewOut(BaseModel):
 
 # ── Search ───────────────────────────────────────────────────
 
-class SearchResult(BaseModel):
-    food_type: FoodTypeOut
-    restaurants: list[RestaurantOut]
-
-
 class FoodDetailResult(BaseModel):
     food_type: FoodTypePopularOut
     restaurants: list[RestaurantOut]
 
 
 class DishSearchResult(BaseModel):
-    """The core 'search a dish, compare across restaurants' response shape."""
+    """The core 'search a food' response: canonical dishes to compare
+    (with stats), plus the flat dish matches."""
     query: str
-    results: list[DishOut]
+    canonical_matches: list[CanonicalDishMatch] = []
+    dishes: list[DishOut] = []

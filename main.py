@@ -4,7 +4,7 @@ from sqlalchemy import inspect, text
 from database import engine
 import models
 
-from routers import auth, dishes, food_images, food_types, places, restaurants, reviews, search
+from routers import auth, dishes, food_images, food_types, places, restaurants, reviews
 
 
 def _add_missing_columns(inspector, table, columns_to_add):
@@ -29,15 +29,14 @@ def run_migrations():
     if "reviews" not in inspector.get_table_names():
         return
 
-    _add_missing_columns(inspector, "reviews", {
-        "user_id": "INTEGER",
-        "dish_id": "INTEGER",
-        "source": "VARCHAR(20) DEFAULT 'user'",
-    })
     _add_missing_columns(inspector, "food_types", {
         "image_url": "TEXT",
-        "taste_tags": "JSON",
         "parent_id": "INTEGER",
+    })
+    _add_missing_columns(inspector, "dishes", {
+        "canonical_dish_id": "INTEGER",
+        "is_active": "BOOLEAN DEFAULT TRUE",
+        "last_seen_at": "TIMESTAMP",
     })
     _add_missing_columns(inspector, "restaurants", {
         "website_url": "TEXT",
@@ -61,9 +60,9 @@ run_migrations()
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
-    title="Bangladesh Food Finder",
-    description="Search for the best restaurants in Bangladesh by food type.",
-    version="1.1.0",
+    title="Khawon",
+    description="Search for a dish and compare it across Dhaka restaurants, with reviews.",
+    version="2.0.0",
 )
 
 # Allow the React frontend to talk to this API
@@ -76,7 +75,6 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
-app.include_router(search.router)
 app.include_router(food_types.router)
 app.include_router(food_images.router)
 app.include_router(places.router)

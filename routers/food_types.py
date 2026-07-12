@@ -29,6 +29,8 @@ async def _resolve_food_image(
 def _enrich_food_types(
     food_types: list[models.FoodType], db: Session
 ) -> list[schemas.FoodTypePopularOut]:
+    """Stats are derived from dishes: restaurant counts via which restaurants
+    serve a dish of the type, review stats via the dishes' reviews."""
     if not food_types:
         return []
 
@@ -36,23 +38,24 @@ def _enrich_food_types(
 
     restaurant_counts = dict(
         db.query(
-            models.RestaurantFoodType.food_type_id,
-            func.count(models.RestaurantFoodType.restaurant_id),
+            models.Dish.food_type_id,
+            func.count(func.distinct(models.Dish.restaurant_id)),
         )
-        .filter(models.RestaurantFoodType.food_type_id.in_(ids))
-        .group_by(models.RestaurantFoodType.food_type_id)
+        .filter(models.Dish.food_type_id.in_(ids), models.Dish.is_active.is_(True))
+        .group_by(models.Dish.food_type_id)
         .all()
     )
 
     review_stats = {
         row[0]: (row[1], row[2])
         for row in db.query(
-            models.Review.food_type_id,
+            models.Dish.food_type_id,
             func.avg(models.Review.rating),
             func.count(models.Review.id),
         )
-        .filter(models.Review.food_type_id.in_(ids))
-        .group_by(models.Review.food_type_id)
+        .join(models.Review, models.Review.dish_id == models.Dish.id)
+        .filter(models.Dish.food_type_id.in_(ids))
+        .group_by(models.Dish.food_type_id)
         .all()
     }
 
@@ -66,7 +69,7 @@ def _enrich_food_types(
                 name=ft.name,
                 description=ft.description,
                 image_url=ft.image_url,
-                taste_tags=ft.taste_tags,
+                parent_id=ft.parent_id,
                 restaurant_count=restaurant_counts.get(ft.id, 0),
                 review_count=review_count or 0,
                 average_rating=avg_rating,
