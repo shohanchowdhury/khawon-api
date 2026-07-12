@@ -4,7 +4,7 @@ from sqlalchemy import inspect, text
 from database import engine
 import models
 
-from routers import auth, food_images, food_types, places, products, restaurants, reviews, search
+from routers import auth, dishes, food_images, food_types, places, restaurants, reviews, search
 
 
 def _add_missing_columns(inspector, table, columns_to_add):
@@ -31,7 +31,7 @@ def run_migrations():
 
     _add_missing_columns(inspector, "reviews", {
         "user_id": "INTEGER",
-        "product_id": "INTEGER",
+        "dish_id": "INTEGER",
         "source": "VARCHAR(20) DEFAULT 'user'",
     })
     _add_missing_columns(inspector, "food_types", {
@@ -80,7 +80,7 @@ app.include_router(search.router)
 app.include_router(food_types.router)
 app.include_router(food_images.router)
 app.include_router(places.router)
-app.include_router(products.router)
+app.include_router(dishes.router)
 app.include_router(restaurants.router)
 app.include_router(reviews.router)
 

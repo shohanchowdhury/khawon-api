@@ -40,7 +40,7 @@ class Cuisine(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False, unique=True)
 
-    product_links = relationship("ProductCuisine", back_populates="cuisine")
+    dish_links = relationship("DishCuisine", back_populates="cuisine")
 
 
 class FlavorTag(Base):
@@ -49,7 +49,7 @@ class FlavorTag(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(50), nullable=False, unique=True)
 
-    product_links = relationship("ProductFlavorTag", back_populates="flavor_tag")
+    dish_links = relationship("DishFlavorTag", back_populates="flavor_tag")
 
 
 class Restaurant(Base):
@@ -80,7 +80,7 @@ class Restaurant(Base):
 
     food_type_links = relationship("RestaurantFoodType", back_populates="restaurant")
     reviews = relationship("Review", back_populates="restaurant")
-    products = relationship("Product", back_populates="restaurant", cascade="all, delete-orphan")
+    dishes = relationship("Dish", back_populates="restaurant", cascade="all, delete-orphan")
 
 
 class RestaurantFoodType(Base):
@@ -94,18 +94,18 @@ class RestaurantFoodType(Base):
     food_type = relationship("FoodType", back_populates="restaurant_links")
 
 
-class Product(Base):
+class Dish(Base):
     """A specific dish/menu item served by a restaurant."""
-    __tablename__ = "products"
+    __tablename__ = "dishes"
     __table_args__ = (
-        UniqueConstraint("restaurant_id", "source_product_id", name="uq_product_restaurant_source"),
+        UniqueConstraint("restaurant_id", "source_dish_id", name="uq_dish_restaurant_source"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     restaurant_id = Column(Integer, ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=False)
     food_type_id = Column(Integer, ForeignKey("food_types.id", ondelete="SET NULL"), nullable=True)
 
-    source_product_id = Column(Integer, nullable=True, index=True)   # foodpanda product id, for upsert idempotency
+    source_dish_id = Column(Integer, nullable=True, index=True)   # foodpanda product id, for upsert idempotency
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     price_bdt = Column(Float, nullable=True)   # Float, not Integer: some foodpanda prices are fractional (e.g. 348.5)
@@ -116,33 +116,33 @@ class Product(Base):
     variations = Column(JSON, nullable=True)                   # [{label, price_bdt}, ...]
     created_at = Column(DateTime, server_default=func.now())
 
-    restaurant = relationship("Restaurant", back_populates="products")
+    restaurant = relationship("Restaurant", back_populates="dishes")
     food_type = relationship("FoodType")
-    reviews = relationship("Review", back_populates="product")
-    cuisine_links = relationship("ProductCuisine", back_populates="product", cascade="all, delete-orphan")
-    flavor_tag_links = relationship("ProductFlavorTag", back_populates="product", cascade="all, delete-orphan")
+    reviews = relationship("Review", back_populates="dish")
+    cuisine_links = relationship("DishCuisine", back_populates="dish", cascade="all, delete-orphan")
+    flavor_tag_links = relationship("DishFlavorTag", back_populates="dish", cascade="all, delete-orphan")
 
 
-class ProductCuisine(Base):
+class DishCuisine(Base):
     """Join table: which cuisines a dish belongs to (multi-label)"""
-    __tablename__ = "product_cuisines"
+    __tablename__ = "dish_cuisines"
 
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True)
+    dish_id = Column(Integer, ForeignKey("dishes.id", ondelete="CASCADE"), primary_key=True)
     cuisine_id = Column(Integer, ForeignKey("cuisines.id", ondelete="CASCADE"), primary_key=True)
 
-    product = relationship("Product", back_populates="cuisine_links")
-    cuisine = relationship("Cuisine", back_populates="product_links")
+    dish = relationship("Dish", back_populates="cuisine_links")
+    cuisine = relationship("Cuisine", back_populates="dish_links")
 
 
-class ProductFlavorTag(Base):
+class DishFlavorTag(Base):
     """Join table: which flavor tags apply to a dish (multi-label)"""
-    __tablename__ = "product_flavor_tags"
+    __tablename__ = "dish_flavor_tags"
 
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True)
+    dish_id = Column(Integer, ForeignKey("dishes.id", ondelete="CASCADE"), primary_key=True)
     flavor_tag_id = Column(Integer, ForeignKey("flavor_tags.id", ondelete="CASCADE"), primary_key=True)
 
-    product = relationship("Product", back_populates="flavor_tag_links")
-    flavor_tag = relationship("FlavorTag", back_populates="product_links")
+    dish = relationship("Dish", back_populates="flavor_tag_links")
+    flavor_tag = relationship("FlavorTag", back_populates="dish_links")
 
 
 class Review(Base):
@@ -151,7 +151,7 @@ class Review(Base):
     id = Column(Integer, primary_key=True, index=True)
     restaurant_id = Column(Integer, ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=False)
     food_type_id = Column(Integer, ForeignKey("food_types.id", ondelete="CASCADE"), nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="SET NULL"), nullable=True)
+    dish_id = Column(Integer, ForeignKey("dishes.id", ondelete="SET NULL"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     reviewer_name = Column(String(100), nullable=True)
     rating = Column(Integer, CheckConstraint("rating BETWEEN 1 AND 5"), nullable=False)
@@ -160,5 +160,5 @@ class Review(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     restaurant = relationship("Restaurant", back_populates="reviews")
-    product = relationship("Product", back_populates="reviews")
+    dish = relationship("Dish", back_populates="reviews")
     user = relationship("User", back_populates="reviews")

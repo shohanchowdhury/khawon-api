@@ -3,13 +3,13 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 import schemas
-from product_detail import get_product, search_products
+from dish_detail import get_dish, search_dishes
 
-router = APIRouter(prefix="/products", tags=["Products"])
+router = APIRouter(prefix="/dishes", tags=["Dishes"])
 
 
 @router.get("/search", response_model=schemas.DishSearchResult)
-def search_dishes(
+def search_dishes_endpoint(
     q: str = Query(..., description="Dish to search, e.g. 'biryani'"),
     db: Session = Depends(get_db),
 ):
@@ -18,12 +18,12 @@ def search_dishes(
     Matches on the dish's own name or its food type. Empty results on no
     match, not a 404 - a dish search coming up empty is a normal state.
     """
-    return schemas.DishSearchResult(query=q, results=search_products(db, q))
+    return schemas.DishSearchResult(query=q, results=search_dishes(db, q))
 
 
-@router.get("/{product_id}", response_model=schemas.ProductOut)
-def get_product_detail(product_id: int, db: Session = Depends(get_db)):
-    product = get_product(db, product_id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return product
+@router.get("/{dish_id}", response_model=schemas.DishOut)
+def get_dish_detail(dish_id: int, db: Session = Depends(get_db)):
+    dish = get_dish(db, dish_id)
+    if dish is None:
+        raise HTTPException(status_code=404, detail="Dish not found")
+    return dish

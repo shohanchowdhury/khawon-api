@@ -8,8 +8,10 @@ products.json    - classify_batch.py's *_products.json (has source_restaurant_co
 restaurants.json - classify_batch.py's *_restaurants.json, after match_google_places.py
                     has filled in google_place_id/match_status
 
-Upserts Restaurant by source_restaurant_code and Product by
-(restaurant_id, source_product_id) - safe to re-run on the same files.
+Upserts Restaurant by source_restaurant_code and Dish by
+(restaurant_id, source_dish_id) - safe to re-run on the same files.
+(The pipeline JSON still calls the foodpanda id "product_id"; it maps to the
+dishes.source_dish_id column.)
 FoodType/Cuisine/FlavorTag rows are get-or-created by name.
 
 Written for bulk performance over a high-latency connection (e.g. Railway's
@@ -51,10 +53,10 @@ def _restaurant_values(r, area):
     }
 
 
-def _product_values(p, restaurant_id, food_type_id):
+def _dish_values(p, restaurant_id, food_type_id):
     return {
         "restaurant_id": restaurant_id,
-        "source_product_id": p["product_id"],
+        "source_dish_id": p["product_id"],   # foodpanda product id from the pipeline JSON
         "food_type_id": food_type_id,
         "name": p["name"],
         "description": p.get("description"),
@@ -181,19 +183,19 @@ def main():
             )
             db.execute(stmt, update_rest_rows)
 
-        # ---- Products: split new vs existing by (restaurant_id, source_product_id) ----
+        # ---- Dishes: split new vs existing by (restaurant_id, source_dish_id) ----
         restaurant_ids = list(code_to_id.values())
-        existing_products = {}
+        existing_dishes = {}
         if restaurant_ids:
-            for pid, rid, spid in db.query(
-                models.Product.id, models.Product.restaurant_id, models.Product.source_product_id
-            ).filter(models.Product.restaurant_id.in_(restaurant_ids)):
-                existing_products[(rid, spid)] = pid
+            for did, rid, sdid in db.query(
+                models.Dish.id, models.Dish.restaurant_id, models.Dish.source_dish_id
+            ).filter(models.Dish.restaurant_id.in_(restaurant_ids)):
+                existing_dishes[(rid, sdid)] = did
 
-        new_prod_rows, update_prod_rows = [], []
-        # desired joins keyed by product natural key, resolved to product ids after insert
-        want_cuisine = {}   # (rid, spid) -> cuisine_id
-        want_flavors = {}   # (rid, spid) -> [flavor_id, ...]
+        new_dish_rows, update_dish_rows = [], []
+        # desired joins keyed by dish natural key, resolved to dish ids after insert
+        want_cuisine = {}   # (rid, sdid) -> cuisine_id
+        want_flavors = {}   # (rid, sdid) -> [flavor_id, ...]
         for p in products:
             rid = code_to_id.get(p.get("source_restaurant_code"))
             if rid is None:
@@ -202,56 +204,56 @@ def main():
                 continue
             leaf = p.get("food_type_leaf")
             food_type_id = ft_id.get(leaf) if leaf else None
-            vals = _product_values(p, rid, food_type_id)
+            vals = _dish_values(p, rid, food_type_id)
             key = (rid, p["product_id"])
-            if key in existing_products:
-                update_prod_rows.append({**vals, "_id": existing_products[key]})
+            if key in existing_dishes:
+                update_dish_rows.append({**vals, "_id": existing_dishes[key]})
                 stats["products_updated"] += 1
             else:
-                new_prod_rows.append(vals)
+                new_dish_rows.append(vals)
                 stats["products_created"] += 1
             if p.get("cuisine") and p["cuisine"] in cu_id:
                 want_cuisine[key] = cu_id[p["cuisine"]]
             want_flavors[key] = [fl_id[n] for n in p.get("flavor_tags", []) if n in fl_id]
 
-        pid_by_key = dict(existing_products)
+        did_by_key = dict(existing_dishes)
         for row in _bulk_insert_returning(
-            db, models.Product, new_prod_rows,
-            models.Product.id, models.Product.restaurant_id, models.Product.source_product_id,
+            db, models.Dish, new_dish_rows,
+            models.Dish.id, models.Dish.restaurant_id, models.Dish.source_dish_id,
         ):
-            pid_by_key[(row.restaurant_id, row.source_product_id)] = row.id
-        if update_prod_rows:
-            cols = [k for k in update_prod_rows[0] if k != "_id"]
+            did_by_key[(row.restaurant_id, row.source_dish_id)] = row.id
+        if update_dish_rows:
+            cols = [k for k in update_dish_rows[0] if k != "_id"]
             stmt = (
-                update(models.Product.__table__)
-                .where(models.Product.__table__.c.id == bindparam("_id"))
+                update(models.Dish.__table__)
+                .where(models.Dish.__table__.c.id == bindparam("_id"))
                 .values({c: bindparam(c) for c in cols})
             )
-            db.execute(stmt, update_prod_rows)
+            db.execute(stmt, update_dish_rows)
 
-        # ---- Join tables: clear existing products' links, then bulk insert all ----
-        updated_ids = [existing_products[k] for k in existing_products]
+        # ---- Join tables: clear existing dishes' links, then bulk insert all ----
+        updated_ids = [existing_dishes[k] for k in existing_dishes]
         if updated_ids:
-            db.execute(delete(models.ProductCuisine).where(
-                models.ProductCuisine.product_id.in_(updated_ids)))
-            db.execute(delete(models.ProductFlavorTag).where(
-                models.ProductFlavorTag.product_id.in_(updated_ids)))
+            db.execute(delete(models.DishCuisine).where(
+                models.DishCuisine.dish_id.in_(updated_ids)))
+            db.execute(delete(models.DishFlavorTag).where(
+                models.DishFlavorTag.dish_id.in_(updated_ids)))
 
         cuisine_join_rows, flavor_join_rows = [], []
         for key, cuisine_id in want_cuisine.items():
-            pid = pid_by_key.get(key)
-            if pid is not None:
-                cuisine_join_rows.append({"product_id": pid, "cuisine_id": cuisine_id})
+            did = did_by_key.get(key)
+            if did is not None:
+                cuisine_join_rows.append({"dish_id": did, "cuisine_id": cuisine_id})
         for key, flavor_ids in want_flavors.items():
-            pid = pid_by_key.get(key)
-            if pid is None:
+            did = did_by_key.get(key)
+            if did is None:
                 continue
             for flavor_id in flavor_ids:
-                flavor_join_rows.append({"product_id": pid, "flavor_tag_id": flavor_id})
+                flavor_join_rows.append({"dish_id": did, "flavor_tag_id": flavor_id})
         if cuisine_join_rows:
-            db.execute(insert(models.ProductCuisine), cuisine_join_rows)
+            db.execute(insert(models.DishCuisine), cuisine_join_rows)
         if flavor_join_rows:
-            db.execute(insert(models.ProductFlavorTag), flavor_join_rows)
+            db.execute(insert(models.DishFlavorTag), flavor_join_rows)
 
         db.commit()
     except Exception:

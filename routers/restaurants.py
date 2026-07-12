@@ -9,7 +9,7 @@ from database import get_db
 import models
 import schemas
 from places import fetch_place_photo_bytes
-from product_detail import get_products_for_restaurant
+from dish_detail import get_dishes_for_restaurant
 from storage import upload_image_bytes
 
 router = APIRouter(prefix="/restaurants", tags=["Restaurants"])
@@ -270,13 +270,13 @@ def delete_restaurant(
     db.commit()
 
 
-@router.get("/{restaurant_id}/products", response_model=list[schemas.ProductOut])
-def get_restaurant_products(restaurant_id: int, db: Session = Depends(get_db)):
+@router.get("/{restaurant_id}/dishes", response_model=list[schemas.DishOut])
+def get_restaurant_dishes(restaurant_id: int, db: Session = Depends(get_db)):
     """A restaurant's menu (dishes)."""
     r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Restaurant not found")
-    return get_products_for_restaurant(db, restaurant_id)
+    return get_dishes_for_restaurant(db, restaurant_id)
 
 
 @router.get("/{restaurant_id}/reviews", response_model=list[schemas.ReviewOut])

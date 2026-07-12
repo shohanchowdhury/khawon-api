@@ -159,17 +159,17 @@ class PlaceSearchResult(BaseModel):
     photos_help: Optional[str] = None
 
 
-# ── Products (dishes) ───────────────────────────────────────
+# ── Dishes ──────────────────────────────────────────────────
 
-class ProductVariationOut(BaseModel):
+class DishVariationOut(BaseModel):
     label: Optional[str] = None
     price_bdt: Optional[float] = None
 
 
-class ProductCreate(BaseModel):
+class DishCreate(BaseModel):
     restaurant_id: int
     food_type_id: Optional[int] = None
-    source_product_id: Optional[int] = None
+    source_dish_id: Optional[int] = None
     name: str
     description: Optional[str] = None
     price_bdt: Optional[float] = None
@@ -177,12 +177,12 @@ class ProductCreate(BaseModel):
     is_sold_out: bool = False
     category_raw: Optional[str] = None
     dietary_attributes_raw: Optional[list[str]] = None
-    variations: Optional[list[ProductVariationOut]] = None
+    variations: Optional[list[DishVariationOut]] = None
     cuisine_ids: list[int] = []
     flavor_tag_ids: list[int] = []
 
 
-class ProductOut(BaseModel):
+class DishOut(BaseModel):
     id: int
     name: str
     description: Optional[str] = None
@@ -190,7 +190,7 @@ class ProductOut(BaseModel):
     image_url: Optional[str] = None
     is_sold_out: bool = False
     category_raw: Optional[str] = None
-    variations: Optional[list[ProductVariationOut]] = None
+    variations: Optional[list[DishVariationOut]] = None
     food_type: Optional[FoodTypeOut] = None
     cuisines: list[CuisineOut] = []
     flavor_tags: list[FlavorTagOut] = []
@@ -201,8 +201,8 @@ class ProductOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class RestaurantWithProductsOut(RestaurantOut):
-    products: list[ProductOut] = []
+class RestaurantWithDishesOut(RestaurantOut):
+    dishes: list[DishOut] = []
 
 
 # ── Reviews ─────────────────────────────────────────────────
@@ -210,7 +210,7 @@ class RestaurantWithProductsOut(RestaurantOut):
 class ReviewCreate(BaseModel):
     restaurant_id: int
     food_type_id: int
-    product_id: Optional[int] = None
+    dish_id: Optional[int] = None
     rating: int = Field(..., ge=1, le=5)
     comment: Optional[str] = None
 
@@ -218,7 +218,7 @@ class ReviewOut(BaseModel):
     id: int
     restaurant_id: int
     food_type_id: int
-    product_id: Optional[int] = None
+    dish_id: Optional[int] = None
     reviewer_name: Optional[str]
     rating: int
     comment: Optional[str]
@@ -243,4 +243,4 @@ class FoodDetailResult(BaseModel):
 class DishSearchResult(BaseModel):
     """The core 'search a dish, compare across restaurants' response shape."""
     query: str
-    results: list[ProductOut]
+    results: list[DishOut]
