@@ -4,7 +4,23 @@ from sqlalchemy import inspect, text
 from database import engine
 import models
 
-from routers import auth, food_images, food_types, places, restaurants, reviews, search
+from routers import auth, food_images, food_types, places, products, restaurants, reviews, search
+
+
+def _add_missing_columns(inspector, table, columns_to_add):
+    """Add any of columns_to_add ({name: sql_type}) missing from `table`.
+
+    Plain ADD COLUMN, no "IF NOT EXISTS" — the existence check above is
+    already the guard, and "IF NOT EXISTS" is invalid syntax on SQLite
+    (only Postgres supports it), so relying on it broke local dev DBs.
+    """
+    if table not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns(table)}
+    for col_name, col_type in columns_to_add.items():
+        if col_name not in existing:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"))
 
 
 def run_migrations():
@@ -12,38 +28,33 @@ def run_migrations():
     inspector = inspect(engine)
     if "reviews" not in inspector.get_table_names():
         return
-    columns = {col["name"] for col in inspector.get_columns("reviews")}
-    if "user_id" not in columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE reviews ADD COLUMN user_id INTEGER"))
 
-    if "food_types" in inspector.get_table_names():
-        ft_columns = {col["name"] for col in inspector.get_columns("food_types")}
-        if "image_url" not in ft_columns:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("ALTER TABLE food_types ADD COLUMN IF NOT EXISTS image_url TEXT")
-                )
-
-    if "restaurants" in inspector.get_table_names():
-        rest_columns = {col["name"] for col in inspector.get_columns("restaurants")}
-        if "website_url" not in rest_columns:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS website_url TEXT")
-                )
-        if "google_place_id" not in rest_columns:
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        "ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS google_place_id VARCHAR(255)"
-                    )
-                )
-        if "image_url" not in rest_columns:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS image_url TEXT")
-                )
+    _add_missing_columns(inspector, "reviews", {
+        "user_id": "INTEGER",
+        "product_id": "INTEGER",
+        "source": "VARCHAR(20) DEFAULT 'user'",
+    })
+    _add_missing_columns(inspector, "food_types", {
+        "image_url": "TEXT",
+        "taste_tags": "JSON",
+        "parent_id": "INTEGER",
+    })
+    _add_missing_columns(inspector, "restaurants", {
+        "website_url": "TEXT",
+        "google_place_id": "VARCHAR(255)",
+        "image_url": "TEXT",
+        "match_status": "VARCHAR(20) DEFAULT 'unmatched'",
+        "source_restaurant_code": "VARCHAR(50)",
+        "chain_name": "VARCHAR(200)",
+        "chain_code": "VARCHAR(50)",
+        "budget": "INTEGER",
+        "foodpanda_rating": "FLOAT",
+        "foodpanda_review_number": "INTEGER",
+        "raw_cuisines": "JSON",
+        "logo_url": "TEXT",
+        "latitude": "FLOAT",
+        "longitude": "FLOAT",
+    })
 
 
 run_migrations()
@@ -69,6 +80,7 @@ app.include_router(search.router)
 app.include_router(food_types.router)
 app.include_router(food_images.router)
 app.include_router(places.router)
+app.include_router(products.router)
 app.include_router(restaurants.router)
 app.include_router(reviews.router)
 
