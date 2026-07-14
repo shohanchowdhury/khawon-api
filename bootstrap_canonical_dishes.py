@@ -293,6 +293,7 @@ def main() -> None:
     print(f"Products left unlinked:    {len(eligible) - linked} (singletons - still browsable)")
     print(f"\nWritten to: {args.output_path}")
 
+    # Spot-check known spelling splits
     for needle in ("Biryani", "Biriyani", "Chili", "Chilli"):
         hits = [c for c in canonical_dishes if needle.lower() in c["name"].lower()]
         if hits:
