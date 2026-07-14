@@ -1,177 +1,299 @@
+"""SQLAlchemy models - SQL-first.
+
+schema.sql is the source of truth for the database (it uses Postgres-native
+features - PostGIS geography, generated columns, GiST/trigram indexes - that
+don't round-trip through the ORM). These models are thin mappings over the
+tables schema.sql creates, used for querying/writing from the app. They do
+NOT drive DDL: main.py must not call create_all(); the schema is applied by
+running schema.sql against the database.
+
+The restaurants.geog generated GEOGRAPHY column is intentionally NOT mapped
+here (needs geoalchemy2 and is generated anyway) - geo "near me" queries run
+as raw SQL against ST_DWithin / <-> on that column.
+"""
+
 from sqlalchemy import (
-    Column, Integer, String, Text, ForeignKey,
-    DateTime, CheckConstraint, JSON, Boolean, Float, UniqueConstraint
+    Column, Integer, SmallInteger, BigInteger, String, Text, ForeignKey,
+    DateTime, CheckConstraint, Boolean, Numeric, UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
 
 
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), nullable=False, unique=True, index=True)
-    username = Column(String(50), nullable=False, unique=True, index=True)
-    hashed_password = Column(String(255), nullable=False)
-    created_at = Column(DateTime, server_default=func.now())
-
-    reviews = relationship("Review", back_populates="user")
-
-
-class FoodType(Base):
-    __tablename__ = "food_types"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False, unique=True)
-    description = Column(Text, nullable=True)
-    image_url = Column(Text, nullable=True)
-    parent_id = Column(Integer, ForeignKey("food_types.id", ondelete="SET NULL"), nullable=True)
-
-    parent = relationship("FoodType", remote_side=[id], back_populates="children")
-    children = relationship("FoodType", back_populates="parent")
-
-
+# --------------------------------------------------------------------------
+# Lookup / reference
+# --------------------------------------------------------------------------
 class Cuisine(Base):
     __tablename__ = "cuisines"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False, unique=True)
-
-    dish_links = relationship("DishCuisine", back_populates="cuisine")
+    id = Column(SmallInteger, primary_key=True)
+    name = Column(Text, nullable=False, unique=True)
 
 
 class FlavorTag(Base):
     __tablename__ = "flavor_tags"
+    id = Column(SmallInteger, primary_key=True)
+    slug = Column(Text, nullable=False, unique=True)
+    label = Column(Text, nullable=False)
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(50), nullable=False, unique=True)
 
-    dish_links = relationship("DishFlavorTag", back_populates="flavor_tag")
+class FoodCategory(Base):
+    __tablename__ = "food_categories"
+    id = Column(SmallInteger, primary_key=True)
+    name = Column(Text, nullable=False, unique=True)
+
+
+class FoodType(Base):
+    __tablename__ = "food_types"
+    id = Column(SmallInteger, primary_key=True)
+    name = Column(Text, nullable=False, unique=True)
+
+    sub_types = relationship("FoodSubType", back_populates="food_type")
+
+
+class FoodSubType(Base):
+    __tablename__ = "food_sub_types"
+    __table_args__ = (UniqueConstraint("food_type_id", "name"),)
+    id = Column(SmallInteger, primary_key=True)
+    food_type_id = Column(SmallInteger, ForeignKey("food_types.id", ondelete="CASCADE"), nullable=False)
+    name = Column(Text, nullable=False)
+
+    food_type = relationship("FoodType", back_populates="sub_types")
+
+
+# --------------------------------------------------------------------------
+# Canonical dishes - cross-restaurant comparison identity
+# --------------------------------------------------------------------------
+class CanonicalDish(Base):
+    __tablename__ = "canonical_dishes"
+    id = Column(Integer, primary_key=True)
+    name = Column(Text, nullable=False)
+    aliases = Column(ARRAY(Text), nullable=False, server_default="{}")
+    food_type_id = Column(SmallInteger, ForeignKey("food_types.id", ondelete="SET NULL"))
+    food_sub_type_id = Column(SmallInteger, ForeignKey("food_sub_types.id", ondelete="SET NULL"))
+    cuisine_id = Column(SmallInteger, ForeignKey("cuisines.id", ondelete="SET NULL"))
+    category_id = Column(SmallInteger, ForeignKey("food_categories.id", ondelete="SET NULL"))
+    image_url = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    food_type = relationship("FoodType")
+    food_sub_type = relationship("FoodSubType")
+    cuisine = relationship("Cuisine")
+    category = relationship("FoodCategory")
+    products = relationship("Product", back_populates="canonical_dish")
+
+
+# --------------------------------------------------------------------------
+# Restaurant domain
+# --------------------------------------------------------------------------
+class RestaurantChain(Base):
+    __tablename__ = "restaurant_chains"
+    id = Column(Integer, primary_key=True)
+    chain_code = Column(Text, nullable=False, unique=True)
+    name = Column(Text, nullable=False)
 
 
 class Restaurant(Base):
     __tablename__ = "restaurants"
+    id = Column(Integer, primary_key=True)
+    source_restaurant_code = Column(Text, nullable=False, unique=True)
+    name = Column(Text, nullable=False)
+    address = Column(Text)
+    latitude = Column(Numeric(10, 8))
+    longitude = Column(Numeric(11, 8))
+    # geog (GEOGRAPHY, generated) intentionally unmapped - see module docstring
+    rating = Column(Numeric(2, 1))
+    review_count = Column(Integer, nullable=False, server_default="0")
+    old_rating = Column(Numeric(2, 1))
+    old_review_count = Column(Integer)
+    budget_tier = Column(SmallInteger)
+    phone = Column(Text)
+    city = Column(Text, nullable=False, server_default="Dhaka")
+    area = Column(Text)
+    chain_id = Column(Integer, ForeignKey("restaurant_chains.id", ondelete="SET NULL"))
+    hero_image_url = Column(Text)
+    logo_image_url = Column(Text)
+    google_place_id = Column(Text)
+    match_status = Column(Text, nullable=False, server_default="unmatched")
+    is_active = Column(Boolean, nullable=False, server_default="true")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(200), nullable=False)
-    area = Column(String(100), nullable=True)       # e.g. Dhanmondi, Gulshan
-    address = Column(Text, nullable=True)
-    phone = Column(String(30), nullable=True)
-    google_maps_url = Column(Text, nullable=True)
-    website_url = Column(Text, nullable=True)
-    google_place_id = Column(String(255), nullable=True)
-    image_url = Column(Text, nullable=True)
-
-    # Scrape-sourced fields (see strip_restaurants.py / classify_batch.py pipeline)
-    match_status = Column(String(20), nullable=False, server_default="unmatched")
-    source_restaurant_code = Column(String(50), nullable=True, index=True)
-    chain_name = Column(String(200), nullable=True)
-    chain_code = Column(String(50), nullable=True)
-    budget = Column(Integer, nullable=True)
-    foodpanda_rating = Column(Float, nullable=True)
-    foodpanda_review_number = Column(Integer, nullable=True)
-    raw_cuisines = Column(JSON, nullable=True)   # unreliable restaurant-level hint; dish-level Cuisine is authoritative
-    logo_url = Column(Text, nullable=True)
-    latitude = Column(Float, nullable=True)
-    longitude = Column(Float, nullable=True)
-
-    dishes = relationship("Dish", back_populates="restaurant", cascade="all, delete-orphan")
-
-
-class CanonicalDish(Base):
-    """A canonical dish concept (e.g. 'Chicken Kacchi') that many restaurants'
-    menu items map to - the unit of cross-restaurant comparison."""
-    __tablename__ = "canonical_dishes"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(255), nullable=False, unique=True)
-    food_type_id = Column(Integer, ForeignKey("food_types.id", ondelete="SET NULL"), nullable=True)
-    aliases = Column(JSON, nullable=True)   # spelling variants: ["biriyani", "kacchi", Bangla script...]
-    image_url = Column(Text, nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
-
-    food_type = relationship("FoodType")
-    dishes = relationship("Dish", back_populates="canonical_dish")
+    chain = relationship("RestaurantChain")
+    products = relationship("Product", back_populates="restaurant", cascade="all, delete-orphan")
+    cuisine_links = relationship("RestaurantCuisine", back_populates="restaurant", cascade="all, delete-orphan")
 
 
-class Dish(Base):
-    """A specific dish/menu item served by a restaurant."""
-    __tablename__ = "dishes"
-    __table_args__ = (
-        UniqueConstraint("restaurant_id", "source_dish_id", name="uq_dish_restaurant_source"),
-    )
+class RestaurantCuisine(Base):
+    __tablename__ = "restaurant_cuisines"
+    restaurant_id = Column(Integer, ForeignKey("restaurants.id", ondelete="CASCADE"), primary_key=True)
+    cuisine_id = Column(SmallInteger, ForeignKey("cuisines.id", ondelete="CASCADE"), primary_key=True)
 
-    id = Column(Integer, primary_key=True, index=True)
+    restaurant = relationship("Restaurant", back_populates="cuisine_links")
+    cuisine = relationship("Cuisine")
+
+
+class RestaurantSource(Base):
+    __tablename__ = "restaurant_sources"
+    __table_args__ = (UniqueConstraint("restaurant_id", "source_name"),)
+    id = Column(Integer, primary_key=True)
     restaurant_id = Column(Integer, ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=False)
-    food_type_id = Column(Integer, ForeignKey("food_types.id", ondelete="SET NULL"), nullable=True)
-    canonical_dish_id = Column(Integer, ForeignKey("canonical_dishes.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_name = Column(Text, nullable=False)
+    source_url = Column(Text)
+    last_scraped_at = Column(DateTime(timezone=True))
+    raw_metadata = Column(JSONB)
 
-    source_dish_id = Column(Integer, nullable=True, index=True)   # foodpanda product id, for upsert idempotency
-    name = Column(String(255), nullable=False)
-    description = Column(Text, nullable=True)
-    price_bdt = Column(Float, nullable=True)   # Float, not Integer: some foodpanda prices are fractional (e.g. 348.5)
-    image_url = Column(Text, nullable=True)
-    is_sold_out = Column(Boolean, nullable=False, server_default="0")
-    category_raw = Column(String(255), nullable=True)          # foodpanda's own category label; weak hint only
-    dietary_attributes_raw = Column(JSON, nullable=True)       # low-coverage/unreliable source hint
-    variations = Column(JSON, nullable=True)                   # [{label, price_bdt}, ...]
-    # Menu lifecycle: re-scrapes mark vanished dishes inactive instead of deleting
-    # them, so their reviews survive.
-    is_active = Column(Boolean, nullable=False, server_default="1")
-    last_seen_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
 
-    restaurant = relationship("Restaurant", back_populates="dishes")
+# --------------------------------------------------------------------------
+# Product / menu domain
+# --------------------------------------------------------------------------
+class Product(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True)
+    source_product_id = Column(BigInteger, nullable=False, unique=True)
+    restaurant_id = Column(Integer, ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=False)
+    name = Column(Text, nullable=False)
+    description = Column(Text)
+    base_price_bdt = Column(Numeric(10, 2), nullable=False)
+    image_url = Column(Text)
+    is_sold_out = Column(Boolean, nullable=False, server_default="false")
+    category_id = Column(SmallInteger, ForeignKey("food_categories.id", ondelete="SET NULL"))
+    cuisine_id = Column(SmallInteger, ForeignKey("cuisines.id", ondelete="SET NULL"))
+    food_type_id = Column(SmallInteger, ForeignKey("food_types.id", ondelete="SET NULL"))
+    food_sub_type_id = Column(SmallInteger, ForeignKey("food_sub_types.id", ondelete="SET NULL"))
+    canonical_dish_id = Column(Integer, ForeignKey("canonical_dishes.id", ondelete="SET NULL"))
+    is_active = Column(Boolean, nullable=False, server_default="true")
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now())
+    rating = Column(Numeric(2, 1))
+    review_count = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    restaurant = relationship("Restaurant", back_populates="products")
+    category = relationship("FoodCategory")
+    cuisine = relationship("Cuisine")
     food_type = relationship("FoodType")
-    canonical_dish = relationship("CanonicalDish", back_populates="dishes")
-    reviews = relationship("Review", back_populates="dish", cascade="all, delete-orphan")
-    cuisine_links = relationship("DishCuisine", back_populates="dish", cascade="all, delete-orphan")
-    flavor_tag_links = relationship("DishFlavorTag", back_populates="dish", cascade="all, delete-orphan")
+    food_sub_type = relationship("FoodSubType")
+    canonical_dish = relationship("CanonicalDish", back_populates="products")
+    variations = relationship("ProductVariation", back_populates="product", cascade="all, delete-orphan")
+    flavor_tag_links = relationship("ProductFlavorTag", back_populates="product", cascade="all, delete-orphan")
+    reviews = relationship("ProductReview", back_populates="product", cascade="all, delete-orphan")
 
 
-class DishCuisine(Base):
-    """Join table: which cuisines a dish belongs to (multi-label)"""
-    __tablename__ = "dish_cuisines"
+class ProductVariation(Base):
+    __tablename__ = "product_variations"
+    __table_args__ = (UniqueConstraint("product_id", "label"),)
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    label = Column(Text, nullable=False, server_default="Regular")
+    price_bdt = Column(Numeric(10, 2), nullable=False)
+    sort_order = Column(SmallInteger, nullable=False, server_default="0")
 
-    dish_id = Column(Integer, ForeignKey("dishes.id", ondelete="CASCADE"), primary_key=True)
-    cuisine_id = Column(Integer, ForeignKey("cuisines.id", ondelete="CASCADE"), primary_key=True)
-
-    dish = relationship("Dish", back_populates="cuisine_links")
-    cuisine = relationship("Cuisine", back_populates="dish_links")
-
-
-class DishFlavorTag(Base):
-    """Join table: which flavor tags apply to a dish (multi-label)"""
-    __tablename__ = "dish_flavor_tags"
-
-    dish_id = Column(Integer, ForeignKey("dishes.id", ondelete="CASCADE"), primary_key=True)
-    flavor_tag_id = Column(Integer, ForeignKey("flavor_tags.id", ondelete="CASCADE"), primary_key=True)
-
-    dish = relationship("Dish", back_populates="flavor_tag_links")
-    flavor_tag = relationship("FlavorTag", back_populates="dish_links")
+    product = relationship("Product", back_populates="variations")
 
 
-class Review(Base):
-    """A user's review of a specific dish. The restaurant is derived through
-    the dish - a dish review is inherently tied to the place serving it.
-    Account required (no anonymous reviews); one review per user per dish
-    (resubmitting updates the existing one)."""
-    __tablename__ = "reviews"
-    __table_args__ = (
-        UniqueConstraint("user_id", "dish_id", name="uq_review_user_dish"),
-    )
+class ProductFlavorTag(Base):
+    __tablename__ = "product_flavor_tags"
+    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True)
+    flavor_tag_id = Column(SmallInteger, ForeignKey("flavor_tags.id", ondelete="CASCADE"), primary_key=True)
 
-    id = Column(Integer, primary_key=True, index=True)
-    dish_id = Column(Integer, ForeignKey("dishes.id", ondelete="CASCADE"), nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    rating = Column(Integer, CheckConstraint("rating BETWEEN 1 AND 5"), nullable=False)
-    comment = Column(Text, nullable=True)
-    # Hook for a future "verified visit" badge (photo/receipt evidence)
-    is_verified = Column(Boolean, nullable=False, server_default="0")
-    verification_photo_url = Column(Text, nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    product = relationship("Product", back_populates="flavor_tag_links")
+    flavor_tag = relationship("FlavorTag")
 
-    dish = relationship("Dish", back_populates="reviews")
-    user = relationship("User", back_populates="reviews")
+
+# --------------------------------------------------------------------------
+# Users & reviews (restaurant-level and product-level, parallel stacks)
+# --------------------------------------------------------------------------
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (CheckConstraint("email IS NOT NULL OR phone IS NOT NULL"),)
+    id = Column(Integer, primary_key=True)
+    email = Column(Text, unique=True)
+    phone = Column(Text, unique=True)
+    password_hash = Column(Text, nullable=False)
+    display_name = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, server_default="true")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    restaurant_reviews = relationship("RestaurantReview", back_populates="user")
+    product_reviews = relationship("ProductReview", back_populates="user")
+
+
+class RestaurantReview(Base):
+    __tablename__ = "restaurant_reviews"
+    __table_args__ = (UniqueConstraint("user_id", "restaurant_id"),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    restaurant_id = Column(Integer, ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=False)
+    rating = Column(SmallInteger, CheckConstraint("rating BETWEEN 1 AND 5"), nullable=False)
+    body = Column(Text)
+    status = Column(Text, nullable=False, server_default="pending")
+    is_verified_visit = Column(Boolean, nullable=False, server_default="false")
+    helpful_count = Column(Integer, nullable=False, server_default="0")
+    not_helpful_count = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="restaurant_reviews")
+    restaurant = relationship("Restaurant")
+    photos = relationship("RestaurantReviewPhoto", back_populates="review", cascade="all, delete-orphan")
+
+
+class RestaurantReviewPhoto(Base):
+    __tablename__ = "restaurant_review_photos"
+    id = Column(Integer, primary_key=True)
+    review_id = Column(Integer, ForeignKey("restaurant_reviews.id", ondelete="CASCADE"), nullable=False)
+    image_url = Column(Text, nullable=False)
+    sort_order = Column(SmallInteger, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    review = relationship("RestaurantReview", back_populates="photos")
+
+
+class RestaurantReviewVote(Base):
+    __tablename__ = "restaurant_review_votes"
+    review_id = Column(Integer, ForeignKey("restaurant_reviews.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    is_helpful = Column(Boolean, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProductReview(Base):
+    __tablename__ = "product_reviews"
+    __table_args__ = (UniqueConstraint("user_id", "product_id"),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    rating = Column(SmallInteger, CheckConstraint("rating BETWEEN 1 AND 5"), nullable=False)
+    body = Column(Text)
+    status = Column(Text, nullable=False, server_default="pending")
+    is_verified_order = Column(Boolean, nullable=False, server_default="false")
+    helpful_count = Column(Integer, nullable=False, server_default="0")
+    not_helpful_count = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="product_reviews")
+    product = relationship("Product", back_populates="reviews")
+    photos = relationship("ProductReviewPhoto", back_populates="review", cascade="all, delete-orphan")
+
+
+class ProductReviewPhoto(Base):
+    __tablename__ = "product_review_photos"
+    id = Column(Integer, primary_key=True)
+    review_id = Column(Integer, ForeignKey("product_reviews.id", ondelete="CASCADE"), nullable=False)
+    image_url = Column(Text, nullable=False)
+    sort_order = Column(SmallInteger, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    review = relationship("ProductReview", back_populates="photos")
+
+
+class ProductReviewVote(Base):
+    __tablename__ = "product_review_votes"
+    review_id = Column(Integer, ForeignKey("product_reviews.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    is_helpful = Column(Boolean, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
