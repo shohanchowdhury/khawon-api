@@ -1,31 +1,29 @@
-"""Load a classify_batch.py + match_google_places.py output pair into the DB.
+"""Load the v2 pipeline output into the schema.sql database.
 
 USAGE:
-    python load_batch.py products.json restaurants.json [--area Dhanmondi]
-    python load_batch.py --sync-links-only
+    python load_batch.py consolidated.json canonical_dishes.json RESTAURANTS_GLOB [--area Dhanmondi]
 
-products.json    - classify_batch.py's *_products.json (has source_restaurant_code,
-                    full product fields, and food_type_leaf/parent/cuisine/flavor_tags)
-restaurants.json - classify_batch.py's *_restaurants.json, after match_google_places.py
-                    has filled in google_place_id/match_status
+    consolidated.json   - consolidate_variants.py output (products; each carries
+                          restaurant name + source_restaurant_code, classification
+                          fields food_type/sub_type/category/cuisine/flavor_tags,
+                          and a variations[] array).
+    canonical_dishes.json - bootstrap_canonical_dishes.py output.
+    RESTAURANTS_GLOB    - glob for the classify *_restaurants.json files that hold
+                          restaurant detail (address/coords/rating/chain/...),
+                          e.g. "v2_output/restaurants_*_restaurants.json".
 
-Upserts Restaurant by source_restaurant_code and Dish by
-(restaurant_id, source_dish_id) - safe to re-run on the same files.
-(The pipeline JSON still calls the foodpanda id "product_id"; it maps to the
-dishes.source_dish_id column.)
-FoodType/Cuisine/FlavorTag rows are get-or-created by name.
-After dish upsert, restaurant_food_types is rebuilt from dishes for batch restaurants
-(or all restaurants with dishes when using --sync-links-only).
+Idempotent: restaurants upsert by source_restaurant_code, products by
+source_product_id. Re-run marks vanished products is_active=false (never
+deletes - product_reviews would cascade away). Bulk Core inserts for
+high-latency (Railway proxy) performance.
 
-Written for bulk performance over a high-latency connection (e.g. Railway's
-public Postgres proxy, ~220ms/round-trip): new rows go in via a handful of
-Core multi-row INSERT ... RETURNING statements rather than one INSERT per row.
-Existing rows (only on a re-run) are updated via executemany, which is slower
-per-row but rare. A fresh load is therefore all bulk inserts = a few dozen
-round-trips total, not tens of thousands.
+SQL-first: assumes schema.sql has already created the tables. This only
+inserts/updates rows; it does not create schema.
 """
 import argparse
+import glob
 import json
+import collections
 from datetime import datetime, timezone
 
 from sqlalchemy import bindparam, delete, insert, update
@@ -34,249 +32,285 @@ from database import SessionLocal
 import models
 
 
-def _restaurant_values(r, area):
-    coords = r.get("coordinates") or {}
-    images = r.get("images") or {}
-    return {
-        "source_restaurant_code": r.get("source_restaurant_code"),
-        "name": r["name"],
-        "address": r.get("address"),
-        "area": area,
-        "latitude": coords.get("latitude"),
-        "longitude": coords.get("longitude"),
-        "raw_cuisines": r.get("cuisines") or [],
-        "foodpanda_rating": r.get("rating"),
-        "foodpanda_review_number": r.get("review_number"),
-        "budget": r.get("budget"),
-        "image_url": images.get("hero"),
-        "logo_url": images.get("logo"),
-        "chain_name": r.get("chain_name"),
-        "chain_code": r.get("chain_code"),
-        "google_place_id": r.get("google_place_id"),
-        "match_status": r.get("match_status") or "unmatched",
-    }
-
-
-def _dish_values(p, restaurant_id, food_type_id, seen_at):
-    return {
-        "restaurant_id": restaurant_id,
-        "source_dish_id": p["product_id"],   # foodpanda product id from the pipeline JSON
-        "food_type_id": food_type_id,
-        "name": p["name"],
-        "description": p.get("description"),
-        "price_bdt": p.get("price_bdt"),
-        "image_url": p.get("image"),
-        "is_sold_out": p.get("is_sold_out", False),
-        "category_raw": p.get("category"),
-        "dietary_attributes_raw": p.get("dietary_attributes") or [],
-        "variations": p.get("variations") or [],
-        "is_active": True,
-        "last_seen_at": seen_at,
-    }
-
-
 def _bulk_insert_returning(db, model, rows, *return_cols):
-    """Bulk-insert `rows` (list of dicts) in one Core statement, returning the
-    requested columns. Returns the RETURNING result rows (order not assumed -
-    callers key off the returned natural-key columns)."""
     if not rows:
         return []
-    stmt = insert(model).returning(*return_cols)
-    return list(db.execute(stmt, rows))
+    return list(db.execute(insert(model).returning(*return_cols), rows))
+
+
+def _get_or_create_lookup(db, model, names, name_col="name"):
+    """Return {name: id} for a simple unique-name lookup table, inserting the
+    missing ones."""
+    existing = {getattr(r, name_col): r.id for r in db.query(model).all()}
+    missing = [n for n in names if n and n not in existing]
+    for row in _bulk_insert_returning(db, model, [{name_col: n} for n in missing],
+                                      getattr(model, name_col), model.id):
+        existing[getattr(row, name_col)] = row.id
+    return existing
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load a classified/matched batch into the DB.")
-    parser.add_argument("products_path")
-    parser.add_argument("restaurants_path")
-    parser.add_argument("--area", default="Dhanmondi")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("products_path")          # consolidated.json
+    ap.add_argument("canonical_path")         # canonical_dishes.json
+    ap.add_argument("restaurants_glob")       # glob for *_restaurants.json
+    ap.add_argument("--area", default="Dhanmondi")
+    args = ap.parse_args()
 
     with open(args.products_path, encoding="utf-8") as f:
         products = json.load(f)
-    with open(args.restaurants_path, encoding="utf-8") as f:
-        restaurants = json.load(f)
+    with open(args.canonical_path, encoding="utf-8") as f:
+        canonical = json.load(f)
+    restaurants = []
+    for path in sorted(glob.glob(args.restaurants_glob)):
+        with open(path, encoding="utf-8") as f:
+            restaurants.extend(json.load(f))
 
     db = SessionLocal()
-    stats = {
-        "restaurants_created": 0, "restaurants_updated": 0,
-        "products_created": 0, "products_updated": 0,
-        "food_types_created": 0, "cuisines_created": 0, "flavor_tags_created": 0,
-    }
-
+    stats = collections.Counter()
     try:
-        # ---- Taxonomy: existing name -> id ----
-        ft_id = {name: id_ for name, id_ in db.query(models.FoodType.name, models.FoodType.id)}
-        cu_id = {name: id_ for name, id_ in db.query(models.Cuisine.name, models.Cuisine.id)}
-        fl_id = {name: id_ for name, id_ in db.query(models.FlavorTag.name, models.FlavorTag.id)}
+        # ---- Lookup tables ----------------------------------------------
+        cuisine_names = {p["cuisine"] for p in products if p.get("cuisine")}
+        cat_names = {p["category"] for p in products if p.get("category")}
+        ft_names = {p["food_type"] for p in products if p.get("food_type")}
+        flavor_slugs = {t for p in products for t in (p.get("flavor_tags") or [])}
 
-        # Collect needed taxonomy from the products file.
-        ft_parent = {}   # name -> parent_name (None for roots)
-        need_cuisines, need_flavors = set(), set()
-        for p in products:
-            leaf, parent = p.get("food_type_leaf"), p.get("food_type_parent")
-            if leaf:
-                ft_parent.setdefault(leaf, parent if parent and parent != leaf else None)
-            if parent and parent != leaf:
-                ft_parent.setdefault(parent, None)
-            if p.get("cuisine"):
-                need_cuisines.add(p["cuisine"])
-            for name in p.get("flavor_tags", []):
-                need_flavors.add(name)
+        cu_id = _get_or_create_lookup(db, models.Cuisine, cuisine_names)
+        cat_id = _get_or_create_lookup(db, models.FoodCategory, cat_names)
+        ft_id = _get_or_create_lookup(db, models.FoodType, ft_names)
 
-        # Insert new roots first (parent None), then new leaves (parent_id resolved).
-        new_roots = [n for n, par in ft_parent.items() if par is None and n not in ft_id]
-        for row in _bulk_insert_returning(
-            db, models.FoodType, [{"name": n} for n in new_roots],
-            models.FoodType.name, models.FoodType.id,
-        ):
-            ft_id[row.name] = row.id
-        new_leaves = [n for n, par in ft_parent.items() if par is not None and n not in ft_id]
-        for row in _bulk_insert_returning(
-            db, models.FoodType,
-            [{"name": n, "parent_id": ft_id.get(ft_parent[n])} for n in new_leaves],
-            models.FoodType.name, models.FoodType.id,
-        ):
-            ft_id[row.name] = row.id
-        stats["food_types_created"] = len(new_roots) + len(new_leaves)
+        # food_sub_types are scoped under a food_type: key (food_type_id, name)
+        need_sub = {(p["food_type"], p["sub_type"]) for p in products
+                    if p.get("food_type") and p.get("sub_type")}
+        sub_id = {(r.food_type_id, r.name): r.id for r in db.query(models.FoodSubType).all()}
+        missing_sub = [{"food_type_id": ft_id[ft], "name": st}
+                       for (ft, st) in need_sub if (ft_id[ft], st) not in sub_id]
+        for row in _bulk_insert_returning(db, models.FoodSubType, missing_sub,
+                                          models.FoodSubType.food_type_id,
+                                          models.FoodSubType.name, models.FoodSubType.id):
+            sub_id[(row.food_type_id, row.name)] = row.id
 
-        new_cuisines = [n for n in need_cuisines if n not in cu_id]
-        for row in _bulk_insert_returning(
-            db, models.Cuisine, [{"name": n} for n in new_cuisines],
-            models.Cuisine.name, models.Cuisine.id,
-        ):
-            cu_id[row.name] = row.id
-        stats["cuisines_created"] = len(new_cuisines)
+        # flavor_tags (slug + label; label = slug prettified)
+        fl_existing = {r.slug: r.id for r in db.query(models.FlavorTag).all()}
+        missing_fl = [{"slug": s, "label": s.replace("_", " ").title()}
+                      for s in flavor_slugs if s not in fl_existing]
+        for row in _bulk_insert_returning(db, models.FlavorTag, missing_fl,
+                                          models.FlavorTag.slug, models.FlavorTag.id):
+            fl_existing[row.slug] = row.id
 
-        new_flavors = [n for n in need_flavors if n not in fl_id]
-        for row in _bulk_insert_returning(
-            db, models.FlavorTag, [{"name": n} for n in new_flavors],
-            models.FlavorTag.name, models.FlavorTag.id,
-        ):
-            fl_id[row.name] = row.id
-        stats["flavor_tags_created"] = len(new_flavors)
+        # ---- Chains -----------------------------------------------------
+        chain_rows = {r["chain_code"]: r.get("chain_name") for r in restaurants
+                      if r.get("chain_code")}
+        chain_id = {r.chain_code: r.id for r in db.query(models.RestaurantChain).all()}
+        missing_chain = [{"chain_code": c, "name": n or c}
+                         for c, n in chain_rows.items() if c not in chain_id]
+        for row in _bulk_insert_returning(db, models.RestaurantChain, missing_chain,
+                                          models.RestaurantChain.chain_code,
+                                          models.RestaurantChain.id):
+            chain_id[row.chain_code] = row.id
 
-        # ---- Restaurants: split new vs existing by source_restaurant_code ----
+        # ---- Restaurants: upsert by source_restaurant_code --------------
+        def rest_values(r):
+            coords = r.get("coordinates") or {}
+            images = r.get("images") or {}
+            return {
+                "source_restaurant_code": r.get("source_restaurant_code"),
+                "name": r["name"],
+                "address": r.get("address"),
+                "latitude": coords.get("latitude"),
+                "longitude": coords.get("longitude"),
+                "old_rating": r.get("rating"),
+                "old_review_count": r.get("review_number"),
+                "budget_tier": r.get("budget"),
+                "phone": r.get("phone"),
+                "city": r.get("city") or "Dhaka",
+                "area": args.area,
+                "chain_id": chain_id.get(r.get("chain_code")),
+                "hero_image_url": images.get("hero"),
+                "logo_image_url": images.get("logo"),
+                "google_place_id": r.get("google_place_id"),
+                "match_status": r.get("match_status") or "unmatched",
+            }
+
         codes = [r.get("source_restaurant_code") for r in restaurants]
-        code_to_id = {
-            code: id_
-            for code, id_ in db.query(
-                models.Restaurant.source_restaurant_code, models.Restaurant.id
-            ).filter(models.Restaurant.source_restaurant_code.in_(codes))
-        }
-        new_rest_rows, update_rest_rows = [], []
-        for r in restaurants:
-            vals = _restaurant_values(r, args.area)
-            code = vals["source_restaurant_code"]
-            if code in code_to_id:
-                update_rest_rows.append({**vals, "_id": code_to_id[code]})
-                stats["restaurants_updated"] += 1
-            else:
-                new_rest_rows.append(vals)
-                stats["restaurants_created"] += 1
+        code_to_id = {c: i for c, i in db.query(
+            models.Restaurant.source_restaurant_code, models.Restaurant.id
+        ).filter(models.Restaurant.source_restaurant_code.in_(codes))}
 
-        for row in _bulk_insert_returning(
-            db, models.Restaurant, new_rest_rows,
-            models.Restaurant.source_restaurant_code, models.Restaurant.id,
-        ):
+        new_rest, upd_rest = [], []
+        for r in restaurants:
+            vals = rest_values(r)
+            if vals["source_restaurant_code"] in code_to_id:
+                upd_rest.append({**vals, "_id": code_to_id[vals["source_restaurant_code"]]})
+                stats["rest_updated"] += 1
+            else:
+                new_rest.append(vals)
+                stats["rest_created"] += 1
+        for row in _bulk_insert_returning(db, models.Restaurant, new_rest,
+                                          models.Restaurant.source_restaurant_code,
+                                          models.Restaurant.id):
             code_to_id[row.source_restaurant_code] = row.id
-        if update_rest_rows:
-            cols = [k for k in update_rest_rows[0] if k not in ("_id", "source_restaurant_code")]
-            stmt = (
+        if upd_rest:
+            cols = [k for k in upd_rest[0] if k not in ("_id", "source_restaurant_code")]
+            db.execute(
                 update(models.Restaurant.__table__)
                 .where(models.Restaurant.__table__.c.id == bindparam("_id"))
-                .values({c: bindparam(c) for c in cols})
+                .values({c: bindparam(c) for c in cols}),
+                upd_rest,
             )
-            db.execute(stmt, update_rest_rows)
 
-        # ---- Dishes: split new vs existing by (restaurant_id, source_dish_id) ----
-        restaurant_ids = list(code_to_id.values())
-        existing_dishes = {}
-        if restaurant_ids:
-            for did, rid, sdid in db.query(
-                models.Dish.id, models.Dish.restaurant_id, models.Dish.source_dish_id
-            ).filter(models.Dish.restaurant_id.in_(restaurant_ids)):
-                existing_dishes[(rid, sdid)] = did
+        # restaurant_cuisines (rebuild for this batch's restaurants)
+        batch_rest_ids = [code_to_id[c] for c in codes if c in code_to_id]
+        if batch_rest_ids:
+            db.execute(delete(models.RestaurantCuisine).where(
+                models.RestaurantCuisine.restaurant_id.in_(batch_rest_ids)))
+        rc_rows = []
+        for r in restaurants:
+            rid = code_to_id.get(r.get("source_restaurant_code"))
+            if rid is None:
+                continue
+            for cname in (r.get("cuisines") or []):
+                cid = cu_id.get(cname)
+                if cid:
+                    rc_rows.append({"restaurant_id": rid, "cuisine_id": cid})
+        # dedupe (a restaurant may list a cuisine twice)
+        rc_rows = [dict(t) for t in {tuple(sorted(d.items())) for d in rc_rows}]
+        if rc_rows:   # rows already cleared above, so plain insert is safe
+            db.execute(insert(models.RestaurantCuisine), rc_rows)
+
+        # ---- Products: upsert by source_product_id ----------------------
+        def prod_values(p, rid):
+            return {
+                "source_product_id": p["product_id"],
+                "restaurant_id": rid,
+                "name": p["name"],
+                "description": p.get("description"),
+                "base_price_bdt": p.get("price_bdt") or 0,
+                "image_url": p.get("image"),
+                "is_sold_out": p.get("is_sold_out", False),
+                "category_id": cat_id.get(p.get("category")),
+                "cuisine_id": cu_id.get(p.get("cuisine")),
+                "food_type_id": ft_id.get(p.get("food_type")),
+                "food_sub_type_id": sub_id.get((p.get("food_type"), p.get("sub_type")))
+                    if p.get("sub_type") else None,
+                "is_active": True,
+                "last_seen_at": seen_at,
+            }
 
         seen_at = datetime.now(timezone.utc)
-        new_dish_rows, update_dish_rows = [], []
-        seen_keys = set()   # (rid, sdid) present in this batch, for deactivation below
-        # desired joins keyed by dish natural key, resolved to dish ids after insert
-        want_cuisine = {}   # (rid, sdid) -> cuisine_id
-        want_flavors = {}   # (rid, sdid) -> [flavor_id, ...]
+        existing_prod = {spid: pid for spid, pid in db.query(
+            models.Product.source_product_id, models.Product.id
+        )}
+        new_prod, upd_prod, seen_spids = [], [], set()
         for p in products:
             rid = code_to_id.get(p.get("source_restaurant_code"))
             if rid is None:
-                print(f"  [skip] {p['name']}: no restaurant for "
-                      f"source_restaurant_code={p.get('source_restaurant_code')!r}")
+                stats["skipped_no_restaurant"] += 1
                 continue
-            leaf = p.get("food_type_leaf")
-            food_type_id = ft_id.get(leaf) if leaf else None
-            vals = _dish_values(p, rid, food_type_id, seen_at)
-            key = (rid, p["product_id"])
-            seen_keys.add(key)
-            if key in existing_dishes:
-                update_dish_rows.append({**vals, "_id": existing_dishes[key]})
-                stats["products_updated"] += 1
+            spid = p["product_id"]
+            seen_spids.add(spid)
+            vals = prod_values(p, rid)
+            if spid in existing_prod:
+                upd_prod.append({**vals, "_id": existing_prod[spid]})
+                stats["prod_updated"] += 1
             else:
-                new_dish_rows.append(vals)
-                stats["products_created"] += 1
-            if p.get("cuisine") and p["cuisine"] in cu_id:
-                want_cuisine[key] = cu_id[p["cuisine"]]
-            want_flavors[key] = [fl_id[n] for n in p.get("flavor_tags", []) if n in fl_id]
+                new_prod.append(vals)
+                stats["prod_created"] += 1
 
-        did_by_key = dict(existing_dishes)
-        for row in _bulk_insert_returning(
-            db, models.Dish, new_dish_rows,
-            models.Dish.id, models.Dish.restaurant_id, models.Dish.source_dish_id,
-        ):
-            did_by_key[(row.restaurant_id, row.source_dish_id)] = row.id
-        if update_dish_rows:
-            cols = [k for k in update_dish_rows[0] if k != "_id"]
-            stmt = (
-                update(models.Dish.__table__)
-                .where(models.Dish.__table__.c.id == bindparam("_id"))
-                .values({c: bindparam(c) for c in cols})
-            )
-            db.execute(stmt, update_dish_rows)
-
-        # Menu lifecycle: dishes of the loaded restaurants that were NOT in
-        # this batch have vanished from the menu - mark inactive, never delete
-        # (their reviews survive; they reactivate if a later scrape has them).
-        vanished_ids = [
-            dish_id for key, dish_id in existing_dishes.items() if key not in seen_keys
-        ]
-        if vanished_ids:
+        prod_id_by_spid = dict(existing_prod)
+        for row in _bulk_insert_returning(db, models.Product, new_prod,
+                                          models.Product.source_product_id, models.Product.id):
+            prod_id_by_spid[row.source_product_id] = row.id
+        if upd_prod:
+            cols = [k for k in upd_prod[0] if k not in ("_id", "source_product_id")]
             db.execute(
-                update(models.Dish.__table__)
-                .where(models.Dish.__table__.c.id.in_(vanished_ids))
-                .values(is_active=False)
+                update(models.Product.__table__)
+                .where(models.Product.__table__.c.id == bindparam("_id"))
+                .values({c: bindparam(c) for c in cols}),
+                upd_prod,
             )
-        stats["dishes_deactivated"] = len(vanished_ids)
 
-        # ---- Join tables: clear existing dishes' links, then bulk insert all ----
-        updated_ids = [existing_dishes[k] for k in existing_dishes]
-        if updated_ids:
-            db.execute(delete(models.DishCuisine).where(
-                models.DishCuisine.dish_id.in_(updated_ids)))
-            db.execute(delete(models.DishFlavorTag).where(
-                models.DishFlavorTag.dish_id.in_(updated_ids)))
+        # menu lifecycle: products of loaded restaurants not seen this batch -> inactive
+        vanished = [pid for spid, pid in existing_prod.items() if spid not in seen_spids]
+        # only within the batch's restaurants
+        if vanished:
+            db.execute(
+                update(models.Product.__table__)
+                .where(models.Product.__table__.c.id.in_(vanished),
+                       models.Product.__table__.c.restaurant_id.in_(batch_rest_ids))
+                .values(is_active=False))
+        stats["prod_deactivated"] = len(vanished)
 
-        cuisine_join_rows, flavor_join_rows = [], []
-        for key, cuisine_id in want_cuisine.items():
-            did = did_by_key.get(key)
-            if did is not None:
-                cuisine_join_rows.append({"dish_id": did, "cuisine_id": cuisine_id})
-        for key, flavor_ids in want_flavors.items():
-            did = did_by_key.get(key)
-            if did is None:
+        # ---- Variations + flavor tags (rebuild for touched products) ----
+        touched_pids = [prod_id_by_spid[s] for s in seen_spids if s in prod_id_by_spid]
+        if touched_pids:
+            db.execute(delete(models.ProductVariation).where(
+                models.ProductVariation.product_id.in_(touched_pids)))
+            db.execute(delete(models.ProductFlavorTag).where(
+                models.ProductFlavorTag.product_id.in_(touched_pids)))
+        var_rows, flav_rows = [], []
+        for p in products:
+            pid = prod_id_by_spid.get(p["product_id"])
+            if pid is None:
                 continue
-            for flavor_id in flavor_ids:
-                flavor_join_rows.append({"dish_id": did, "flavor_tag_id": flavor_id})
-        if cuisine_join_rows:
-            db.execute(insert(models.DishCuisine), cuisine_join_rows)
-        if flavor_join_rows:
-            db.execute(insert(models.DishFlavorTag), flavor_join_rows)
+            seen_labels = set()
+            for i, v in enumerate(p.get("variations") or []):
+                label = v.get("label") or "Regular"
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                var_rows.append({"product_id": pid, "label": label,
+                                 "price_bdt": v.get("price_bdt") or 0, "sort_order": i})
+            for slug in (p.get("flavor_tags") or []):
+                fid = fl_existing.get(slug)
+                if fid:
+                    flav_rows.append({"product_id": pid, "flavor_tag_id": fid})
+        flav_rows = [dict(t) for t in {tuple(sorted(d.items())) for d in flav_rows}]
+        if var_rows:
+            db.execute(insert(models.ProductVariation), var_rows)
+        if flav_rows:
+            db.execute(insert(models.ProductFlavorTag), flav_rows)
+
+        # ---- Canonical dishes + link products ---------------------------
+        # rebuild canonical set (idempotent full replace is simplest and the
+        # bootstrap is deterministic). Clear links first, then recreate.
+        db.execute(update(models.Product.__table__).values(canonical_dish_id=None))
+        db.execute(delete(models.CanonicalDish))
+        cd_rows = []
+        for c in canonical:
+            ft = c.get("food_type")
+            st = c.get("sub_type")
+            cd_rows.append({
+                "name": c["name"],
+                "aliases": c.get("aliases") or [],
+                "food_type_id": ft_id.get(ft),
+                "food_sub_type_id": sub_id.get((ft, st)) if st else None,
+                "cuisine_id": cu_id.get(c.get("cuisine")),
+                "category_id": cat_id.get(c.get("category")),
+            })
+        # insert canonicals, keep mapping by list order via RETURNING id + name
+        # (name may repeat across food_types, so map by (name, food_type_id))
+        created = _bulk_insert_returning(db, models.CanonicalDish, cd_rows,
+                                         models.CanonicalDish.id, models.CanonicalDish.name,
+                                         models.CanonicalDish.food_type_id)
+        key_to_cdid = {(r.name, r.food_type_id): r.id for r in created}
+        link_updates = []
+        for c in canonical:
+            cdid = key_to_cdid.get((c["name"], ft_id.get(c.get("food_type"))))
+            if cdid is None:
+                continue
+            for spid in c.get("member_source_product_ids", []):
+                pid = prod_id_by_spid.get(spid)
+                if pid is not None:
+                    link_updates.append({"_id": pid, "cdid": cdid})
+        if link_updates:
+            db.execute(
+                update(models.Product.__table__)
+                .where(models.Product.__table__.c.id == bindparam("_id"))
+                .values(canonical_dish_id=bindparam("cdid")),
+                link_updates)
+        stats["canonical_created"] = len(created)
+        stats["products_linked"] = len(link_updates)
 
         db.commit()
     except Exception:
@@ -285,12 +319,13 @@ def main():
     finally:
         db.close()
 
-    print(f"Restaurants: {stats['restaurants_created']} created, {stats['restaurants_updated']} updated")
-    print(f"Dishes: {stats['products_created']} created, {stats['products_updated']} updated, "
-          f"{stats.get('dishes_deactivated', 0)} deactivated (vanished from menu)")
-    print(f"New FoodTypes: {stats['food_types_created']}, "
-          f"new Cuisines: {stats['cuisines_created']}, "
-          f"new FlavorTags: {stats['flavor_tags_created']}")
+    print(f"Restaurants: {stats['rest_created']} created, {stats['rest_updated']} updated")
+    print(f"Products: {stats['prod_created']} created, {stats['prod_updated']} updated, "
+          f"{stats['prod_deactivated']} deactivated")
+    print(f"Canonical dishes: {stats['canonical_created']} created, "
+          f"{stats['products_linked']} products linked")
+    if stats["skipped_no_restaurant"]:
+        print(f"Skipped (no restaurant): {stats['skipped_no_restaurant']}")
 
 
 if __name__ == "__main__":
