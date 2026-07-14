@@ -43,9 +43,32 @@ def _area_from_path(path: str, fallback: str) -> str:
     return AREA_LABELS.get(match.group(1).lower(), match.group(1).capitalize())
 
 
+def _ts_log(message: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[load_batch {ts}] {message}", flush=True)
+
+
 def _commit_phase(db, label: str) -> None:
+    _ts_log(f"committing: {label}...")
     db.commit()
-    print(f"[load_batch] committed: {label}", flush=True)
+    _ts_log(f"committed: {label}")
+
+
+def _bulk_update_by_id(db, table, rows: list[dict], *, label: str, chunk_size: int = 500) -> None:
+    """Chunked executemany updates so Railway proxy loads show steady progress."""
+    if not rows:
+        return
+    cols = [k for k in rows[0] if k != "_id"]
+    stmt = (
+        update(table)
+        .where(table.c.id == bindparam("_id"))
+        .values({c: bindparam(c) for c in cols})
+    )
+    total = len(rows)
+    for start in range(0, total, chunk_size):
+        chunk = rows[start : start + chunk_size]
+        db.execute(stmt, chunk)
+        _ts_log(f"{label}: {min(start + chunk_size, total)}/{total}")
 
 
 def _bulk_set_canonical_links(db, link_updates: list[dict]) -> None:
@@ -66,6 +89,7 @@ def _bulk_set_canonical_links(db, link_updates: list[dict]) -> None:
             stmt,
             {"pids": [row["_id"] for row in chunk], "cdids": [row["cdid"] for row in chunk]},
         )
+        _ts_log(f"canonical links: {min(start + chunk_size, len(link_updates))}/{len(link_updates)}")
 
 
 def _bulk_insert_returning(db, model, rows, *return_cols):
@@ -104,15 +128,15 @@ def main():
             for row in json.load(f):
                 restaurants.append({**row, "_area": area})
 
-    print(
-        f"[load_batch] loaded {len(products)} products, {len(canonical)} canonical dishes, "
-        f"{len(restaurants)} restaurants",
-        flush=True,
+    _ts_log(
+        f"loaded {len(products)} products, {len(canonical)} canonical dishes, "
+        f"{len(restaurants)} restaurants"
     )
 
     db = SessionLocal()
     stats = collections.Counter()
     try:
+        _ts_log("phase 1/3: lookups, chains, restaurants")
         # ---- Lookup tables ----------------------------------------------
         cuisine_names = {p["cuisine"] for p in products if p.get("cuisine")}
         cat_names = {p["category"] for p in products if p.get("category")}
@@ -195,12 +219,11 @@ def main():
                                           models.Restaurant.id):
             code_to_id[row.source_restaurant_code] = row.id
         if upd_rest:
-            cols = [k for k in upd_rest[0] if k not in ("_id", "source_restaurant_code")]
-            db.execute(
-                update(models.Restaurant.__table__)
-                .where(models.Restaurant.__table__.c.id == bindparam("_id"))
-                .values({c: bindparam(c) for c in cols}),
+            _bulk_update_by_id(
+                db,
+                models.Restaurant.__table__,
                 upd_rest,
+                label="restaurants updated",
             )
 
         # restaurant_cuisines (rebuild for this batch's restaurants)
@@ -224,6 +247,7 @@ def main():
 
         _commit_phase(db, "lookups, chains, restaurants")
 
+        _ts_log("phase 2/3: products, variations, flavor tags")
         # ---- Products: upsert by source_product_id ----------------------
         def prod_values(p, rid):
             return {
@@ -244,11 +268,15 @@ def main():
             }
 
         seen_at = datetime.now(timezone.utc)
+        _ts_log("fetching existing products from DB...")
         existing_prod = {spid: pid for spid, pid in db.query(
             models.Product.source_product_id, models.Product.id
         )}
+        _ts_log(f"found {len(existing_prod)} existing products; building upsert batches...")
         new_prod, upd_prod, seen_spids = [], [], set()
-        for p in products:
+        for i, p in enumerate(products, start=1):
+            if i % 4000 == 0:
+                _ts_log(f"scanned products: {i}/{len(products)}")
             rid = code_to_id.get(p.get("source_restaurant_code"))
             if rid is None:
                 stats["skipped_no_restaurant"] += 1
@@ -264,16 +292,17 @@ def main():
                 stats["prod_created"] += 1
 
         prod_id_by_spid = dict(existing_prod)
-        for row in _bulk_insert_returning(db, models.Product, new_prod,
-                                          models.Product.source_product_id, models.Product.id):
-            prod_id_by_spid[row.source_product_id] = row.id
+        if new_prod:
+            _ts_log(f"inserting {len(new_prod)} new products...")
+            for row in _bulk_insert_returning(db, models.Product, new_prod,
+                                              models.Product.source_product_id, models.Product.id):
+                prod_id_by_spid[row.source_product_id] = row.id
         if upd_prod:
-            cols = [k for k in upd_prod[0] if k not in ("_id", "source_product_id")]
-            db.execute(
-                update(models.Product.__table__)
-                .where(models.Product.__table__.c.id == bindparam("_id"))
-                .values({c: bindparam(c) for c in cols}),
+            _bulk_update_by_id(
+                db,
+                models.Product.__table__,
                 upd_prod,
+                label="products updated",
             )
 
         # menu lifecycle: products of loaded restaurants not seen this batch -> inactive
@@ -294,6 +323,7 @@ def main():
                 models.ProductVariation.product_id.in_(touched_pids)))
             db.execute(delete(models.ProductFlavorTag).where(
                 models.ProductFlavorTag.product_id.in_(touched_pids)))
+        _ts_log("rebuilding variations + flavor tags...")
         var_rows, flav_rows = [], []
         for p in products:
             pid = prod_id_by_spid.get(p["product_id"])
@@ -319,6 +349,7 @@ def main():
 
         _commit_phase(db, "products, variations, flavor tags")
 
+        _ts_log("phase 3/3: canonical dishes + product links")
         # ---- Canonical dishes + link products ---------------------------
         # rebuild canonical set (idempotent full replace is simplest and the
         # bootstrap is deterministic). Clear links first, then recreate.
@@ -352,6 +383,7 @@ def main():
                 if pid is not None:
                     link_updates.append({"_id": pid, "cdid": cdid})
         if link_updates:
+            _ts_log(f"linking {len(link_updates)} products to canonical dishes...")
             _bulk_set_canonical_links(db, link_updates)
         stats["canonical_created"] = len(created)
         stats["products_linked"] = len(link_updates)

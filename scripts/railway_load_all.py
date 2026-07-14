@@ -12,6 +12,7 @@ DATA = Path(r"C:\Users\shoha\OneDrive\Desktop\strip data\code\v2_output")
 def main() -> None:
     cmd = [
         sys.executable,
+        "-u",
         str(ROOT / "load_batch.py"),
         str(DATA / "consolidated.json"),
         str(DATA / "canonical_dishes.json"),
