@@ -54,6 +54,123 @@ def _commit_phase(db, label: str) -> None:
     _ts_log(f"committed: {label}")
 
 
+def _norm_price(value) -> float:
+    if value is None:
+        return 0.0
+    return float(value)
+
+
+def _prod_signature(vals: dict) -> tuple:
+    return (
+        vals["restaurant_id"],
+        vals["name"],
+        vals.get("description"),
+        _norm_price(vals.get("base_price_bdt")),
+        vals.get("image_url"),
+        bool(vals.get("is_sold_out", False)),
+        vals.get("category_id"),
+        vals.get("cuisine_id"),
+        vals.get("food_type_id"),
+        vals.get("food_sub_type_id"),
+    )
+
+
+def _prod_signature_from_row(row) -> tuple:
+    return (
+        row.restaurant_id,
+        row.name,
+        row.description,
+        _norm_price(row.base_price_bdt),
+        row.image_url,
+        bool(row.is_sold_out),
+        row.category_id,
+        row.cuisine_id,
+        row.food_type_id,
+        row.food_sub_type_id,
+    )
+
+
+def _touch_batch_products(db, restaurant_ids: list[int], seen_at: datetime) -> None:
+    if not restaurant_ids:
+        return
+    _ts_log(f"touching last_seen_at for products in {len(restaurant_ids)} restaurants...")
+    db.execute(
+        text(
+            """
+            UPDATE products
+            SET last_seen_at = :seen_at, is_active = TRUE
+            WHERE restaurant_id = ANY(CAST(:restaurant_ids AS int[]))
+            """
+        ),
+        {"seen_at": seen_at, "restaurant_ids": restaurant_ids},
+    )
+
+
+def _bulk_update_products_unnest(
+    db, rows: list[dict], *, label: str, chunk_size: int = 1000
+) -> None:
+    """Single-round-trip product updates via unnest (fast over Railway proxy)."""
+    if not rows:
+        return
+    stmt = text(
+        """
+        UPDATE products AS p SET
+            restaurant_id = d.restaurant_id,
+            name = d.name,
+            description = d.description,
+            base_price_bdt = d.base_price_bdt,
+            image_url = d.image_url,
+            is_sold_out = d.is_sold_out,
+            category_id = d.category_id,
+            cuisine_id = d.cuisine_id,
+            food_type_id = d.food_type_id,
+            food_sub_type_id = d.food_sub_type_id,
+            is_active = TRUE,
+            last_seen_at = :seen_at
+        FROM unnest(
+            CAST(:ids AS int[]),
+            CAST(:restaurant_ids AS int[]),
+            CAST(:names AS text[]),
+            CAST(:descriptions AS text[]),
+            CAST(:prices AS numeric[]),
+            CAST(:image_urls AS text[]),
+            CAST(:is_sold_out AS boolean[]),
+            CAST(:category_ids AS int[]),
+            CAST(:cuisine_ids AS int[]),
+            CAST(:food_type_ids AS int[]),
+            CAST(:food_sub_type_ids AS int[])
+        ) AS d(
+            id, restaurant_id, name, description, base_price_bdt, image_url,
+            is_sold_out, category_id, cuisine_id, food_type_id, food_sub_type_id
+        )
+        WHERE p.id = d.id
+        """
+    )
+    total = len(rows)
+    _ts_log(f"{label}: 0/{total}")
+    for start in range(0, total, chunk_size):
+        chunk = rows[start : start + chunk_size]
+        seen_at = chunk[0]["last_seen_at"]
+        db.execute(
+            stmt,
+            {
+                "seen_at": seen_at,
+                "ids": [row["_id"] for row in chunk],
+                "restaurant_ids": [row["restaurant_id"] for row in chunk],
+                "names": [row["name"] for row in chunk],
+                "descriptions": [row.get("description") for row in chunk],
+                "prices": [_norm_price(row.get("base_price_bdt")) for row in chunk],
+                "image_urls": [row.get("image_url") for row in chunk],
+                "is_sold_out": [bool(row.get("is_sold_out", False)) for row in chunk],
+                "category_ids": [row.get("category_id") for row in chunk],
+                "cuisine_ids": [row.get("cuisine_id") for row in chunk],
+                "food_type_ids": [row.get("food_type_id") for row in chunk],
+                "food_sub_type_ids": [row.get("food_sub_type_id") for row in chunk],
+            },
+        )
+        _ts_log(f"{label}: {min(start + chunk_size, total)}/{total}")
+
+
 def _bulk_update_by_id(db, table, rows: list[dict], *, label: str, chunk_size: int = 500) -> None:
     """Chunked executemany updates so Railway proxy loads show steady progress."""
     if not rows:
@@ -269,9 +386,24 @@ def main():
 
         seen_at = datetime.now(timezone.utc)
         _ts_log("fetching existing products from DB...")
-        existing_prod = {spid: pid for spid, pid in db.query(
-            models.Product.source_product_id, models.Product.id
-        )}
+        existing_rows = db.query(
+            models.Product.source_product_id,
+            models.Product.id,
+            models.Product.restaurant_id,
+            models.Product.name,
+            models.Product.description,
+            models.Product.base_price_bdt,
+            models.Product.image_url,
+            models.Product.is_sold_out,
+            models.Product.category_id,
+            models.Product.cuisine_id,
+            models.Product.food_type_id,
+            models.Product.food_sub_type_id,
+        ).all()
+        existing_prod = {row.source_product_id: row.id for row in existing_rows}
+        existing_sigs = {
+            row.source_product_id: _prod_signature_from_row(row) for row in existing_rows
+        }
         _ts_log(f"found {len(existing_prod)} existing products; building upsert batches...")
         new_prod, upd_prod, seen_spids = [], [], set()
         for i, p in enumerate(products, start=1):
@@ -285,22 +417,29 @@ def main():
             seen_spids.add(spid)
             vals = prod_values(p, rid)
             if spid in existing_prod:
-                upd_prod.append({**vals, "_id": existing_prod[spid]})
-                stats["prod_updated"] += 1
+                if existing_sigs.get(spid) == _prod_signature(vals):
+                    stats["prod_unchanged"] += 1
+                else:
+                    upd_prod.append({**vals, "_id": existing_prod[spid]})
+                    stats["prod_updated"] += 1
             else:
                 new_prod.append(vals)
                 stats["prod_created"] += 1
 
+        _ts_log(
+            f"batches ready: {len(new_prod)} new, {len(upd_prod)} changed, "
+            f"{stats['prod_unchanged']} unchanged"
+        )
         prod_id_by_spid = dict(existing_prod)
         if new_prod:
             _ts_log(f"inserting {len(new_prod)} new products...")
             for row in _bulk_insert_returning(db, models.Product, new_prod,
                                               models.Product.source_product_id, models.Product.id):
                 prod_id_by_spid[row.source_product_id] = row.id
+        _touch_batch_products(db, batch_rest_ids, seen_at)
         if upd_prod:
-            _bulk_update_by_id(
+            _bulk_update_products_unnest(
                 db,
-                models.Product.__table__,
                 upd_prod,
                 label="products updated",
             )
@@ -317,12 +456,32 @@ def main():
         stats["prod_deactivated"] = len(vanished)
 
         # ---- Variations + flavor tags (rebuild for touched products) ----
-        touched_pids = [prod_id_by_spid[s] for s in seen_spids if s in prod_id_by_spid]
-        if touched_pids:
-            db.execute(delete(models.ProductVariation).where(
-                models.ProductVariation.product_id.in_(touched_pids)))
-            db.execute(delete(models.ProductFlavorTag).where(
-                models.ProductFlavorTag.product_id.in_(touched_pids)))
+        if batch_rest_ids:
+            _ts_log("clearing variations + flavor tags for batch restaurants...")
+            db.execute(
+                text(
+                    """
+                    DELETE FROM product_variations
+                    WHERE product_id IN (
+                        SELECT id FROM products
+                        WHERE restaurant_id = ANY(CAST(:restaurant_ids AS int[]))
+                    )
+                    """
+                ),
+                {"restaurant_ids": batch_rest_ids},
+            )
+            db.execute(
+                text(
+                    """
+                    DELETE FROM product_flavor_tags
+                    WHERE product_id IN (
+                        SELECT id FROM products
+                        WHERE restaurant_id = ANY(CAST(:restaurant_ids AS int[]))
+                    )
+                    """
+                ),
+                {"restaurant_ids": batch_rest_ids},
+            )
         _ts_log("rebuilding variations + flavor tags...")
         var_rows, flav_rows = [], []
         for p in products:
@@ -397,7 +556,7 @@ def main():
 
     print(f"Restaurants: {stats['rest_created']} created, {stats['rest_updated']} updated")
     print(f"Products: {stats['prod_created']} created, {stats['prod_updated']} updated, "
-          f"{stats['prod_deactivated']} deactivated")
+          f"{stats['prod_unchanged']} unchanged, {stats['prod_deactivated']} deactivated")
     print(f"Canonical dishes: {stats['canonical_created']} created, "
           f"{stats['products_linked']} products linked")
     if stats["skipped_no_restaurant"]:
