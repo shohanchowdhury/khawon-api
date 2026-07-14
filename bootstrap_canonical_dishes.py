@@ -6,139 +6,240 @@ restaurant menu items into CANONICAL DISHES - the cross-restaurant comparison
 identity that powers Khawon's core "search a dish, compare it across
 restaurants" feature.
 
-WHY THIS EXISTS (and why food_type/sub_type can't do this job):
-food_type/sub_type is a deliberately COARSE browsing classification - one
-sub type ("Rice/Biryani-Kacchi") intentionally holds chicken biryani, mutton
-kacchi AND beef tehari together, so it's useless as a comparison axis (you'd
-compare a 160tk chicken biryani against a 995tk mutton biryani). A canonical
-dish is the opposite: a FINE identity that only groups rows that are actually
-the same dish, so "/compare/{canonical_id}" returns a true apples-to-apples
-price/rating list.
+Grouping passes:
+  1. Conservative size/prefix normalization (unchanged).
+  2. Spelling + plural + token-order normalization for match keys.
+  3. Fuzzy cluster merge within the same food_type for near-identical keys.
 
-APPROACH (rule-based first pass, per owner's design decisions):
-  1. Normalize each product name - conservative: strip size labels (Half/
-     Full/250g/4pcs), '1:1 -' prefixes, and punctuation, but KEEP modifier
-     words (Special/Shahi/Premium). Aggressive word-stripping was measured to
-     add <1% coverage while risking merging genuinely-different dishes
-     ("Special Chicken Kacchi" is often a bigger/premium dish, not the plain
-     one), so it's deliberately not done.
-  2. Group by (food_type, normalized_name) - NOT sub_type. sub_type is left
-     out of the key on purpose: the classifier is sometimes inconsistent
-     about a dish's sub type across restaurants ("Beef Tehari" tagged Tehari
-     at 25 places, Biryani/Kacchi at 3), and those are the SAME dish - so
-     including sub_type in the key wrongly fragments one dish into two
-     un-comparable canonical dishes. The dish NAME is its identity; the
-     canonical's own sub_type is then the majority label among its members.
-     food_type IS kept in the key, because a shared name across different
-     food types is often a genuinely DIFFERENT dish ("Beef Kala Bhuna" the
-     curry at 8 restaurants vs the kala-bhuna PIZZA at Domino's) - merging
-     those would compare a 200tk curry against a 900tk pizza. Keeping
-     food_type in the key isolates them correctly. The residual cost is a
-     few genuine cross-food-type same-dishes left split (a "Club Sandwich"
-     classified Sandwich at some places, Burger at others) - that's a
-     harmless under-merge, both halves still browsable.
-  3. Promote a group to a canonical dish ONLY if it spans 2+ DIFFERENT
-     restaurants - a name at a single restaurant isn't proof of a shared
-     dish, so it stays unlinked (still browsable via food_type, just not
-     "compared").
-  4. Set Menu / combo items are EXCLUDED entirely - a "Family Feast" at two
-     restaurants is two different bundles, not the same dish.
+Set Menu / combo items are EXCLUDED entirely.
 
-WHAT THIS IS NOT: this is exact-after-normalization matching only. It does
-NOT unify genuine spelling variants (Biryani vs Biriyani) or word-order
-differences (Chicken Kacchi vs Kacchi Chicken). That's deferred future work
-(fuzzy / embedding-based matching) - the aliases[] list and the nullable
-canonical_dish_id FK are designed so it can be layered in later without a
-schema change or re-linking existing dishes.
-
-Output: canonical_dishes.json - each record self-contained for a DB loader to
-create the canonical_dishes row and backfill products.canonical_dish_id via
-the member_source_product_ids list. Idempotent: same input -> same grouping,
-and canonical ids are assigned deterministically (sorted) so re-runs are
-stable.
-
-Runs AFTER consolidate_variants.py - it reads that stage's output
-(consolidated.json), where same-restaurant size rows are already merged into
-one product each, so a canonical's price range reflects real cross-restaurant
-variation, not one restaurant's portion ladder.
-
-Usage:  python bootstrap_canonical_dishes.py [output.json]
-        (reads v2_output/consolidated.json; defaults output to
-         v2_output/canonical_dishes.json)
+Usage:
+    python bootstrap_canonical_dishes.py [output.json]
+    python bootstrap_canonical_dishes.py [output.json] --input v2_output/consolidated.json
 """
 
-import sys
-import re
-import json
+from __future__ import annotations
+
+import argparse
 import collections
+import json
+import re
+from difflib import SequenceMatcher
 
 INPUT_PATH = "v2_output/consolidated.json"
-MIN_RESTAURANTS = 2          # promotion threshold (owner's call)
-EXCLUDED_FOOD_TYPES = {"Set Menu"}   # combos are restaurant-specific bundles
+MIN_RESTAURANTS = 2
+EXCLUDED_FOOD_TYPES = {"Set Menu"}
+FUZZY_MERGE_THRESHOLD = 0.92
 
-# Size / portion / packaging tokens - stripped, because they describe the
-# same dish in a different quantity, not a different dish. (pcs?/pieces? use
-# optional-s so "5 Pcs" matches whole - see consolidate_variants.py note.)
 SIZE_PATTERNS = [
-    r"^\d+\s*:\s*\d+\s*-?\s*",                        # '1:1 -' style prefixes
-    r"\b\d+\s*(?:pcs?|pieces?)\b",                    # piece counts
-    r"\b\d+\s*(?:gm|gram|grams|g|kg|ml|ltr|l)\b",     # weights / volumes
+    r"^\d+\s*:\s*\d+\s*-?\s*",
+    r"\b\d+\s*(?:pcs?|pieces?)\b",
+    r"\b\d+\s*(?:gm|gram|grams|g|kg|ml|ltr|l)\b",
     r"-?\s*\b(?:half|full|3\s*quarter|quarter|small|medium|large|reg|regular|xl)\b",
 ]
 
+# Phrase-level normalizations (longest first).
+PHRASE_NORMALIZATIONS = [
+    (r"milk\s*shakes?", "milkshake"),
+    (r"cheese\s*cakes?", "cheesecake"),
+    (r"cashew\s*nuts?", "cashew"),
+    (r"kala\s*bhuna", "kalabhuna"),
+    (r"double\s*decker", "doubledecker"),
+]
 
-def normalize_name(name):
-    """Conservative normalization - collapses size/portion variants of the
-    same dish, keeps everything that might distinguish two real dishes."""
+# Whole-word spelling variants seen across Dhaka menus.
+SPELLING_MAP = {
+    "biriyani": "biryani",
+    "biriani": "biryani",
+    "chilli": "chili",
+    "chily": "chili",
+    "singara": "shingara",
+    "shingra": "shingara",
+    "duble": "double",
+    "chap": "chaap",
+    "cookies": "cookie",
+    "nuggets": "nugget",
+    "drumsticks": "drumstick",
+    "vegetables": "vegetable",
+    "shakes": "shake",
+    "smoothies": "smoothie",
+    "noodles": "noodle",
+    "momos": "momo",
+    "parathas": "paratha",
+    "naans": "naan",
+    "rotis": "roti",
+    "luchis": "luchi",
+    "khichuris": "khichuri",
+    "teharies": "tehari",
+    "kachis": "kacchi",
+    "kachchi": "kacchi",
+    "polaos": "polao",
+    "pilafs": "polao",
+    "pilau": "polao",
+    "pulao": "polao",
+    "wings": "wing",
+    "burgers": "burger",
+    "pizzas": "pizza",
+    "sandwiches": "sandwich",
+    "wraps": "wrap",
+    "rolls": "roll",
+    "soups": "soup",
+    "salads": "salad",
+    "kebabs": "kebab",
+    "kababs": "kebab",
+    "kabab": "kebab",
+    "lovers": "lover",
+}
+
+# If these modifier tokens differ between two names, do not fuzzy-merge.
+DISTINCT_MODIFIERS = {
+    "shahi", "malai", "hyderabadi", "kashmiri", "bombay", "handi", "dum",
+    "special", "premium", "deluxe", "royal", "classic", "naga", "tikka",
+    "makhani", "garlic", "schezwan", "szechuan", "bbq", "smoky", "crispy",
+    "grilled", "fried", "steamed", "roasted", "smoked", "spicy", "hot",
+    "veg", "vegetable", "plain", "masala", "butter", "cheese", "egg",
+}
+
+PROTEIN_TOKENS = {
+    "chicken", "beef", "mutton", "fish", "prawn", "shrimp", "paneer",
+    "egg", "duck", "lamb", "pork", "squid", "crab", "lobster", "turkey",
+    "vegetable", "veg", "mushroom", "tofu",
+}
+
+
+def normalize_name(name: str) -> str:
+    """Strip sizes/prefixes/punctuation. Keeps distinguishing modifier words."""
     n = (name or "").lower()
     for pat in SIZE_PATTERNS:
         n = re.sub(pat, " ", n)
-    n = re.sub(r"[^\w\s]", " ", n)      # punctuation -> space
+    n = re.sub(r"[^\w\s]", " ", n)
     n = re.sub(r"\s+", " ", n).strip()
     return n
 
 
-def load_products():
-    with open(INPUT_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
+def apply_spelling_map(text: str) -> str:
+    n = text
+    for pattern, replacement in PHRASE_NORMALIZATIONS:
+        n = re.sub(pattern, replacement, n)
+    tokens = n.split()
+    return " ".join(SPELLING_MAP.get(tok, tok) for tok in tokens)
 
 
-def build_canonical_dishes(products):
-    groups = collections.defaultdict(list)
+def canonical_match_key(name: str) -> str:
+    """Match key: conservative normalize -> spelling -> sorted tokens."""
+    n = normalize_name(name)
+    if not n:
+        return n
+    n = apply_spelling_map(n)
+    tokens = [t for t in n.split() if t not in {"with", "and", "the", "a", "an", "of"}]
+    if not tokens:
+        return n
+    return " ".join(sorted(tokens))
+
+
+def _token_set(key: str) -> set[str]:
+    return set(key.split())
+
+
+def _protein_signature(key: str) -> frozenset[str]:
+    tokens = _token_set(key)
+    found = tokens & PROTEIN_TOKENS
+    if "veg" in found:
+        found = (found - {"vegetable"}) | {"veg"}
+    return frozenset(found)
+
+
+def _modifiers_compatible(a: str, b: str) -> bool:
+    ma = _token_set(a) & DISTINCT_MODIFIERS
+    mb = _token_set(b) & DISTINCT_MODIFIERS
+    return ma == mb
+
+
+def _proteins_compatible(a: str, b: str) -> bool:
+    return _protein_signature(a) == _protein_signature(b)
+
+
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _can_merge_keys(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if not _modifiers_compatible(a, b):
+        return False
+    if not _proteins_compatible(a, b):
+        return False
+    return _similarity(a, b) >= FUZZY_MERGE_THRESHOLD
+
+
+def _merge_promoted_groups(promoted: list[tuple[tuple[str, str], list[dict]]]) -> list[tuple[tuple[str, str], list[dict]]]:
+    """Union-find fuzzy merge within each food_type bucket."""
+    by_food_type: dict[str, list[tuple[tuple[str, str], list[dict]]]] = collections.defaultdict(list)
+    for entry in promoted:
+        by_food_type[entry[0][0]].append(entry)
+
+    merged: list[tuple[tuple[str, str], list[dict]]] = []
+    for food_type, entries in by_food_type.items():
+        parent = list(range(len(entries)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                if _can_merge_keys(entries[i][0][1], entries[j][0][1]):
+                    union(i, j)
+
+        clusters: dict[int, list[int]] = collections.defaultdict(list)
+        for i in range(len(entries)):
+            clusters[find(i)].append(i)
+
+        for indices in clusters.values():
+            rep_key = min(entries[i][0][1] for i in indices)
+            combined_items: list[dict] = []
+            for i in indices:
+                combined_items.extend(entries[i][1])
+            merged.append(((food_type, rep_key), combined_items))
+
+    merged.sort(key=lambda kv: (kv[0][0], kv[0][1]))
+    return merged
+
+
+def build_canonical_dishes(products: list[dict]) -> tuple[list[dict], int]:
+    groups: dict[tuple[str, str], list[dict]] = collections.defaultdict(list)
     for p in products:
-        if p.get("food_type") in EXCLUDED_FOOD_TYPES:
+        if p.get("food_type") in EXCLUDED_FOOD_TYPES or p.get("food_type") is None:
             continue
-        if p.get("food_type") is None:
+        match_key = canonical_match_key(p.get("name", ""))
+        if not match_key:
             continue
-        norm = normalize_name(p.get("name", ""))
-        if not norm:
-            continue
-        key = (p["food_type"], norm)
-        groups[key].append(p)
+        groups[(p["food_type"], match_key)].append(p)
 
-    # Promote only groups spanning >= MIN_RESTAURANTS distinct restaurants.
-    promoted = []
+    promoted: list[tuple[tuple[str, str], list[dict]]] = []
     for key, items in groups.items():
         restaurants = {x.get("restaurant") for x in items}
         if len(restaurants) >= MIN_RESTAURANTS:
             promoted.append((key, items))
 
-    # Deterministic id assignment (sorted by the group key) so re-runs are
-    # stable and diffable.
-    promoted.sort(key=lambda kv: (kv[0][0], kv[0][1]))
+    before_merge = len(promoted)
+    promoted = _merge_promoted_groups(promoted)
+    merge_count = before_merge - len(promoted)
 
-    # Canonical-level authoritative attributes = majority label among members.
-    # The classifier may disagree across restaurants for the same dish; the
-    # plurality is the single best answer, and using it for grouping/filtering
-    # (rather than the noisy per-product values) keeps a dish from flickering
-    # in and out of a cuisine/category filter. Ties break toward a non-null,
-    # then alphabetically, for determinism.
     def majority(values):
         counts = collections.Counter(values)
         return max(counts.items(), key=lambda kv: (kv[1], kv[0] is not None, str(kv[0])))[0]
 
     canonical_dishes = []
-    for canonical_id, ((food_type, norm), items) in enumerate(promoted, start=1):
+    for canonical_id, ((food_type, _match_key), items) in enumerate(promoted, start=1):
         raw_names = collections.Counter(x["name"].strip() for x in items)
         display_name = raw_names.most_common(1)[0][0]
         aliases = sorted(n for n in raw_names if n != display_name)
@@ -158,21 +259,27 @@ def build_canonical_dishes(products):
             "price_max_bdt": max(prices) if prices else None,
             "member_source_product_ids": sorted(x["product_id"] for x in items),
         })
-    return canonical_dishes
+    return canonical_dishes, merge_count
 
 
-def main():
-    output_path = sys.argv[1] if len(sys.argv) > 1 else "v2_output/canonical_dishes.json"
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output_path", nargs="?", default="v2_output/canonical_dishes.json")
+    parser.add_argument("--input", default=INPUT_PATH)
+    args = parser.parse_args()
 
-    products = load_products()
-    eligible = [p for p in products
-                if p.get("food_type") not in EXCLUDED_FOOD_TYPES
-                and p.get("food_type") is not None]
+    with open(args.input, encoding="utf-8") as fh:
+        products = json.load(fh)
 
-    canonical_dishes = build_canonical_dishes(products)
+    eligible = [
+        p for p in products
+        if p.get("food_type") not in EXCLUDED_FOOD_TYPES and p.get("food_type") is not None
+    ]
+
+    canonical_dishes, merge_count = build_canonical_dishes(products)
     linked = sum(c["product_count"] for c in canonical_dishes)
 
-    with open(output_path, "w", encoding="utf-8") as fh:
+    with open(args.output_path, "w", encoding="utf-8") as fh:
         json.dump(canonical_dishes, fh, indent=2, ensure_ascii=False)
 
     total = len(products)
@@ -180,18 +287,27 @@ def main():
     print(f"Total products:            {total}")
     print(f"Set Menu (excluded):       {setmenu}")
     print(f"Eligible for canonical:    {len(eligible)}")
+    print(f"Fuzzy groups merged:       {merge_count}")
     print(f"Canonical dishes created:  {len(canonical_dishes)}")
-    print(f"Products linked:           {linked} ({linked/len(eligible)*100:.1f}% of eligible)")
+    print(f"Products linked:           {linked} ({linked / len(eligible) * 100:.1f}% of eligible)")
     print(f"Products left unlinked:    {len(eligible) - linked} (singletons - still browsable)")
-    print(f"\nWritten to: {output_path}")
+    print(f"\nWritten to: {args.output_path}")
 
-    # Sample - biggest canonical dishes by restaurant spread
+    # Spot-check known spelling splits
+    for needle in ("Biryani", "Biriyani", "Chili", "Chilli"):
+        hits = [c for c in canonical_dishes if needle.lower() in c["name"].lower()]
+        if hits:
+            top = max(hits, key=lambda c: c["restaurant_count"])
+            print(f'  "{needle}" best match: "{top["name"]}" @ {top["restaurant_count"]} restaurants')
+
     top = sorted(canonical_dishes, key=lambda c: -c["restaurant_count"])[:15]
     print(f"\n--- Top 15 canonical dishes by restaurant spread ---")
     for c in top:
-        print(f'  {c["restaurant_count"]:3} rest | {c["food_type"]}/{c["sub_type"]} | '
-              f'"{c["name"]}" | {c["price_min_bdt"]:.0f}-{c["price_max_bdt"]:.0f}tk'
-              f'{" | +" + str(len(c["aliases"])) + " aliases" if c["aliases"] else ""}')
+        alias_note = f' | +{len(c["aliases"])} aliases' if c["aliases"] else ""
+        print(
+            f'  {c["restaurant_count"]:3} rest | {c["food_type"]}/{c["sub_type"]} | '
+            f'"{c["name"]}" | {c["price_min_bdt"]:.0f}-{c["price_max_bdt"]:.0f}tk{alias_note}'
+        )
 
 
 if __name__ == "__main__":
