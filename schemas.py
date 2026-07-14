@@ -32,7 +32,7 @@ class FoodTypeCreate(BaseModel):
 class FoodTypeOut(BaseModel):
     id: int
     name: str
-    description: Optional[str]
+    description: Optional[str] = None
     image_url: Optional[str] = None
     parent_id: Optional[int] = None
 

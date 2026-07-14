@@ -220,6 +220,18 @@ class User(Base):
     restaurant_reviews = relationship("RestaurantReview", back_populates="user")
     product_reviews = relationship("ProductReview", back_populates="user")
 
+    # Back-compat read aliases so existing API code (which predates the
+    # username->display_name / hashed_password->password_hash rename) keeps
+    # working for serialization and password checks. Writes use the real
+    # column names (display_name / password_hash) directly.
+    @property
+    def username(self) -> str:
+        return self.display_name
+
+    @property
+    def hashed_password(self) -> str:
+        return self.password_hash
+
 
 class RestaurantReview(Base):
     __tablename__ = "restaurant_reviews"

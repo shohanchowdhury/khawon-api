@@ -24,12 +24,48 @@ import argparse
 import glob
 import json
 import collections
+import re
 from datetime import datetime, timezone
 
-from sqlalchemy import bindparam, delete, insert, update
+from sqlalchemy import bindparam, delete, insert, text, update
 
 from database import SessionLocal
 import models
+
+AREA_FROM_PATH = re.compile(r"restaurants_([a-z]+)_", re.IGNORECASE)
+AREA_LABELS = {"dhanmondi": "Dhanmondi", "gulshan": "Gulshan", "uttara": "Uttara"}
+
+
+def _area_from_path(path: str, fallback: str) -> str:
+    match = AREA_FROM_PATH.search(path.replace("\\", "/"))
+    if not match:
+        return fallback
+    return AREA_LABELS.get(match.group(1).lower(), match.group(1).capitalize())
+
+
+def _commit_phase(db, label: str) -> None:
+    db.commit()
+    print(f"[load_batch] committed: {label}", flush=True)
+
+
+def _bulk_set_canonical_links(db, link_updates: list[dict]) -> None:
+    if not link_updates:
+        return
+    stmt = text(
+        """
+        UPDATE products AS p
+        SET canonical_dish_id = data.cdid
+        FROM unnest(CAST(:pids AS int[]), CAST(:cdids AS int[])) AS data(pid, cdid)
+        WHERE p.id = data.pid
+        """
+    )
+    chunk_size = 3000
+    for start in range(0, len(link_updates), chunk_size):
+        chunk = link_updates[start : start + chunk_size]
+        db.execute(
+            stmt,
+            {"pids": [row["_id"] for row in chunk], "cdids": [row["cdid"] for row in chunk]},
+        )
 
 
 def _bulk_insert_returning(db, model, rows, *return_cols):
@@ -63,8 +99,16 @@ def main():
         canonical = json.load(f)
     restaurants = []
     for path in sorted(glob.glob(args.restaurants_glob)):
+        area = _area_from_path(path, args.area)
         with open(path, encoding="utf-8") as f:
-            restaurants.extend(json.load(f))
+            for row in json.load(f):
+                restaurants.append({**row, "_area": area})
+
+    print(
+        f"[load_batch] loaded {len(products)} products, {len(canonical)} canonical dishes, "
+        f"{len(restaurants)} restaurants",
+        flush=True,
+    )
 
     db = SessionLocal()
     stats = collections.Counter()
@@ -124,7 +168,7 @@ def main():
                 "budget_tier": r.get("budget"),
                 "phone": r.get("phone"),
                 "city": r.get("city") or "Dhaka",
-                "area": args.area,
+                "area": r.get("_area") or args.area,
                 "chain_id": chain_id.get(r.get("chain_code")),
                 "hero_image_url": images.get("hero"),
                 "logo_image_url": images.get("logo"),
@@ -177,6 +221,8 @@ def main():
         rc_rows = [dict(t) for t in {tuple(sorted(d.items())) for d in rc_rows}]
         if rc_rows:   # rows already cleared above, so plain insert is safe
             db.execute(insert(models.RestaurantCuisine), rc_rows)
+
+        _commit_phase(db, "lookups, chains, restaurants")
 
         # ---- Products: upsert by source_product_id ----------------------
         def prod_values(p, rid):
@@ -271,6 +317,8 @@ def main():
         if flav_rows:
             db.execute(insert(models.ProductFlavorTag), flav_rows)
 
+        _commit_phase(db, "products, variations, flavor tags")
+
         # ---- Canonical dishes + link products ---------------------------
         # rebuild canonical set (idempotent full replace is simplest and the
         # bootstrap is deterministic). Clear links first, then recreate.
@@ -304,15 +352,11 @@ def main():
                 if pid is not None:
                     link_updates.append({"_id": pid, "cdid": cdid})
         if link_updates:
-            db.execute(
-                update(models.Product.__table__)
-                .where(models.Product.__table__.c.id == bindparam("_id"))
-                .values(canonical_dish_id=bindparam("cdid")),
-                link_updates)
+            _bulk_set_canonical_links(db, link_updates)
         stats["canonical_created"] = len(created)
         stats["products_linked"] = len(link_updates)
 
-        db.commit()
+        _commit_phase(db, "canonical dishes + links")
     except Exception:
         db.rollback()
         raise
