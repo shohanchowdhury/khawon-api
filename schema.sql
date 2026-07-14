@@ -54,8 +54,11 @@ CREATE TABLE food_sub_types (
 -- Canonical dishes - the cross-restaurant COMPARISON identity, distinct from
 -- food_type/sub_type (which is a small, deliberately-coarse browsing
 -- classification). Bootstrapped by normalizing product names, grouping by
--- (food_type, sub_type, normalized_name), and promoting a group to a
--- canonical dish only when it spans 2+ DIFFERENT restaurants - a name that
+-- (food_type, normalized_name) - sub_type is deliberately NOT part of the key
+-- because the per-product classifier disagrees on sub_type for the same dish
+-- (e.g. Beef Tehari tagged Tehari at one restaurant, Biryani at another) and
+-- would fragment the group - and promoting a group to a canonical dish only
+-- when it spans 2+ DIFFERENT restaurants - a name that
 -- only ever appears at one restaurant isn't proof of being a shared dish,
 -- so it stays unlinked (products.canonical_dish_id nullable) and is still
 -- perfectly browsable via food_type, just not "compared."

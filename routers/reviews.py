@@ -18,19 +18,19 @@ def submit_review(
 ):
     """Review a dish (requires sign-in). The restaurant is derived through the
     dish. One review per user per dish - submitting again updates your review."""
-    dish = db.query(models.Dish).filter(models.Dish.id == data.dish_id).first()
+    dish = db.query(models.Product).filter(models.Product.id == data.dish_id).first()
     if not dish:
         raise HTTPException(status_code=404, detail="Dish not found")
 
-    review = db.query(models.Review).filter(
-        models.Review.user_id == current_user.id,
-        models.Review.dish_id == data.dish_id,
+    review = db.query(models.ProductReview).filter(
+        models.ProductReview.user_id == current_user.id,
+        models.ProductReview.product_id == data.dish_id,
     ).first()
     if review is None:
-        review = models.Review(dish_id=data.dish_id, user_id=current_user.id)
+        review = models.ProductReview(product_id=data.dish_id, user_id=current_user.id)
         db.add(review)
     review.rating = data.rating
-    review.comment = data.comment
+    review.body = data.comment
 
     db.commit()
     db.refresh(review)
@@ -43,7 +43,7 @@ def delete_review(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    review = db.query(models.Review).filter(models.Review.id == review_id).first()
+    review = db.query(models.ProductReview).filter(models.ProductReview.id == review_id).first()
     if not review:
         raise HTTPException(status_code=404, detail="Review not found")
     if review.user_id != current_user.id:

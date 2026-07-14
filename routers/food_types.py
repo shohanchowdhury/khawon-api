@@ -38,24 +38,24 @@ def _enrich_food_types(
 
     restaurant_counts = dict(
         db.query(
-            models.Dish.food_type_id,
-            func.count(func.distinct(models.Dish.restaurant_id)),
+            models.Product.food_type_id,
+            func.count(func.distinct(models.Product.restaurant_id)),
         )
-        .filter(models.Dish.food_type_id.in_(ids), models.Dish.is_active.is_(True))
-        .group_by(models.Dish.food_type_id)
+        .filter(models.Product.food_type_id.in_(ids), models.Product.is_active.is_(True))
+        .group_by(models.Product.food_type_id)
         .all()
     )
 
     review_stats = {
         row[0]: (row[1], row[2])
         for row in db.query(
-            models.Dish.food_type_id,
-            func.avg(models.Review.rating),
-            func.count(models.Review.id),
+            models.Product.food_type_id,
+            func.avg(models.ProductReview.rating),
+            func.count(models.ProductReview.id),
         )
-        .join(models.Review, models.Review.dish_id == models.Dish.id)
-        .filter(models.Dish.food_type_id.in_(ids))
-        .group_by(models.Dish.food_type_id)
+        .join(models.ProductReview, models.ProductReview.product_id == models.Product.id)
+        .filter(models.Product.food_type_id.in_(ids))
+        .group_by(models.Product.food_type_id)
         .all()
     }
 
@@ -67,9 +67,10 @@ def _enrich_food_types(
             schemas.FoodTypePopularOut(
                 id=ft.id,
                 name=ft.name,
-                description=ft.description,
-                image_url=ft.image_url,
-                parent_id=ft.parent_id,
+                # food_types is a bare (id, name) lookup in the v2 schema.
+                description=None,
+                image_url=None,
+                parent_id=None,
                 restaurant_count=restaurant_counts.get(ft.id, 0),
                 review_count=review_count or 0,
                 average_rating=avg_rating,
@@ -144,13 +145,9 @@ async def create_food_type(
     if existing:
         raise HTTPException(status_code=400, detail=f"Food type '{name}' already exists")
 
-    image_url = await _resolve_food_image(ai_image_id, image)
-
-    ft = models.FoodType(
-        name=name,
-        description=description or None,
-        image_url=image_url,
-    )
+    # v2 schema: food_types is a bare (id, name) lookup. description / image are
+    # accepted for backward compat but not persisted.
+    ft = models.FoodType(name=name)
     db.add(ft)
     db.commit()
     db.refresh(ft)
@@ -180,12 +177,9 @@ async def update_food_type(
     if duplicate:
         raise HTTPException(status_code=400, detail=f"Food type '{name}' already exists")
 
+    # v2 schema: food_types is a bare (id, name) lookup. description / image are
+    # accepted for backward compat but not persisted.
     ft.name = name
-    ft.description = description or None
-    new_image_url = await _resolve_food_image(ai_image_id, image)
-    if new_image_url:
-        ft.image_url = new_image_url
-
     db.commit()
     db.refresh(ft)
     return ft
@@ -199,22 +193,13 @@ async def update_food_type_photo(
     db: Session = Depends(get_db),
     _current_user: models.User = Depends(get_current_user),
 ):
-    """Update only the food type photo from AI generation or a file upload."""
-    ft = db.query(models.FoodType).filter(models.FoodType.id == food_type_id).first()
-    if not ft:
-        raise HTTPException(status_code=404, detail="Food type not found")
-
-    new_image_url = await _resolve_food_image(ai_image_id, image)
-    if not new_image_url:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide an AI image selection or upload an image file.",
-        )
-
-    ft.image_url = new_image_url
-    db.commit()
-    db.refresh(ft)
-    return ft
+    """Deprecated in the v2 schema - food_types no longer has an image column
+    (the rich browsable image entity is canonical_dishes). Kept as an explicit
+    501 so the admin UI gets a clear message instead of a silent no-op."""
+    raise HTTPException(
+        status_code=501,
+        detail="Food-type images are not supported in the v2 schema.",
+    )
 
 
 @router.delete("/{food_type_id}", status_code=204)

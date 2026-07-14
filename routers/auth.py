@@ -15,13 +15,13 @@ def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
     if db.query(models.User).filter(models.User.email == data.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    if db.query(models.User).filter(models.User.username == data.username).first():
+    if db.query(models.User).filter(models.User.display_name == data.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
 
     user = models.User(
         email=data.email,
-        username=data.username,
-        hashed_password=hash_password(data.password),
+        display_name=data.username,
+        password_hash=hash_password(data.password),
     )
     db.add(user)
     db.commit()
@@ -37,11 +37,11 @@ def login(
     user = (
         db.query(models.User)
         .filter(
-            (models.User.username == form.username) | (models.User.email == form.username)
+            (models.User.display_name == form.username) | (models.User.email == form.username)
         )
         .first()
     )
-    if not user or not verify_password(form.password, user.hashed_password):
+    if not user or not verify_password(form.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",

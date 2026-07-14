@@ -1,4 +1,5 @@
-import json
+import re
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -15,63 +16,109 @@ from storage import upload_image_bytes
 router = APIRouter(prefix="/restaurants", tags=["Restaurants"])
 
 
+def _num(v):
+    return float(v) if v is not None else None
+
+
+def _food_types_for_restaurants(db: Session, ids: list[int]) -> dict[int, list[models.FoodType]]:
+    """A restaurant's food types are derived from its active products."""
+    out: dict[int, list[models.FoodType]] = {}
+    if not ids:
+        return out
+    for restaurant_id, food_type in (
+        db.query(models.Product.restaurant_id, models.FoodType)
+        .join(models.FoodType, models.Product.food_type_id == models.FoodType.id)
+        .filter(models.Product.restaurant_id.in_(ids), models.Product.is_active.is_(True))
+        .distinct()
+        .all()
+    ):
+        out.setdefault(restaurant_id, []).append(food_type)
+    return out
+
+
+def _restaurant_review_stats(db: Session, ids: list[int]) -> dict[int, tuple]:
+    """A restaurant's rating = the ratings of its products' reviews (reviews are
+    dish-anchored; the restaurant link flows through the product)."""
+    if not ids:
+        return {}
+    return {
+        row[0]: (row[1], row[2])
+        for row in db.query(
+            models.Product.restaurant_id,
+            func.avg(models.ProductReview.rating),
+            func.count(models.ProductReview.id),
+        )
+        .join(models.ProductReview, models.ProductReview.product_id == models.Product.id)
+        .filter(models.Product.restaurant_id.in_(ids))
+        .group_by(models.Product.restaurant_id)
+        .all()
+    }
+
+
+def _restaurant_out(
+    r: models.Restaurant,
+    food_types: list[models.FoodType],
+    average_rating: float | None,
+    review_count: int,
+) -> schemas.RestaurantOut:
+    return schemas.RestaurantOut(
+        id=r.id,
+        name=r.name,
+        area=r.area,
+        address=r.address,
+        phone=r.phone,
+        # v2 schema has no google_maps_url / website_url columns -> None.
+        google_maps_url=None,
+        website_url=None,
+        google_place_id=r.google_place_id,
+        image_url=r.hero_image_url,
+        food_types=[schemas.FoodTypeOut(id=ft.id, name=ft.name) for ft in food_types],
+        average_rating=average_rating,
+        review_count=review_count,
+        match_status=r.match_status,
+        source_restaurant_code=r.source_restaurant_code,
+        chain_name=r.chain.name if r.chain else None,
+        chain_code=r.chain.chain_code if r.chain else None,
+        budget=r.budget_tier,
+        foodpanda_rating=_num(r.old_rating),
+        foodpanda_review_number=r.old_review_count,
+        raw_cuisines=[link.cuisine.name for link in r.cuisine_links if link.cuisine],
+        logo_url=r.logo_image_url,
+        latitude=_num(r.latitude),
+        longitude=_num(r.longitude),
+    )
+
+
+def build_restaurant_out(
+    r: models.Restaurant,
+    db: Session,
+    average_rating: float | None = None,
+    review_count: int | None = None,
+) -> schemas.RestaurantOut:
+    """Single restaurant -> RestaurantOut. Rating stats are derived from its
+    products' reviews unless caller passes a scoped override."""
+    if average_rating is None and review_count is None:
+        avg_raw, review_count = _restaurant_review_stats(db, [r.id]).get(r.id, (None, 0))
+        average_rating = round(float(avg_raw), 1) if avg_raw else None
+    food_types = _food_types_for_restaurants(db, [r.id]).get(r.id, [])
+    return _restaurant_out(r, food_types, average_rating, review_count or 0)
+
+
 def _enrich_restaurants(
     restaurants: list[models.Restaurant], db: Session
 ) -> list[schemas.RestaurantOut]:
     if not restaurants:
         return []
-
     ids = [r.id for r in restaurants]
-
-    # A restaurant's rating = the ratings of its dishes' reviews (reviews are
-    # dish-anchored; the restaurant link flows through the dish).
-    review_stats = {
-        row[0]: (row[1], row[2])
-        for row in db.query(
-            models.Dish.restaurant_id,
-            func.avg(models.Review.rating),
-            func.count(models.Review.id),
-        )
-        .join(models.Review, models.Review.dish_id == models.Dish.id)
-        .filter(models.Dish.restaurant_id.in_(ids))
-        .group_by(models.Dish.restaurant_id)
-        .all()
-    }
-
-    # A restaurant's food types are derived from its dishes' classifications.
-    food_types_by_restaurant: dict[int, list[models.FoodType]] = {}
-    for restaurant_id, food_type in (
-        db.query(models.Dish.restaurant_id, models.FoodType)
-        .join(models.FoodType, models.Dish.food_type_id == models.FoodType.id)
-        .filter(models.Dish.restaurant_id.in_(ids), models.Dish.is_active.is_(True))
-        .distinct()
-        .all()
-    ):
-        food_types_by_restaurant.setdefault(restaurant_id, []).append(food_type)
+    review_stats = _restaurant_review_stats(db, ids)
+    food_types_by_restaurant = _food_types_for_restaurants(db, ids)
 
     results = []
     for r in restaurants:
         avg_raw, review_count = review_stats.get(r.id, (None, 0))
         avg_rating = round(float(avg_raw), 1) if avg_raw else None
-        food_types = food_types_by_restaurant.get(r.id, [])
-
         results.append(
-            schemas.RestaurantOut(
-                id=r.id,
-                name=r.name,
-                area=r.area,
-                address=r.address,
-                phone=r.phone,
-                google_maps_url=r.google_maps_url,
-                website_url=r.website_url,
-                google_place_id=r.google_place_id,
-                image_url=r.image_url,
-                food_types=[
-                    schemas.FoodTypeOut.model_validate(ft) for ft in food_types
-                ],
-                average_rating=avg_rating,
-                review_count=review_count or 0,
-            )
+            _restaurant_out(r, food_types_by_restaurant.get(r.id, []), avg_rating, review_count or 0)
         )
     return results
 
@@ -146,15 +193,21 @@ async def create_restaurant(
     the restaurant's dishes, not set directly."""
     image_url = await _resolve_restaurant_image(google_photo_name, image)
 
+    # A user-created restaurant still needs a stable natural key (schema requires
+    # source_restaurant_code NOT NULL UNIQUE); derive a slug + short unique suffix.
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "restaurant"
+    code = f"user-{slug}-{uuid.uuid4().hex[:8]}"
+
     restaurant = models.Restaurant(
+        source_restaurant_code=code,
         name=name,
         area=area or None,
         address=address or None,
         phone=phone or None,
-        google_maps_url=google_maps_url or None,
-        website_url=website_url or None,
+        # v2 schema has no google_maps_url / website_url columns; those form
+        # fields are accepted for backward compat but not persisted.
         google_place_id=google_place_id or None,
-        image_url=image_url,
+        hero_image_url=image_url,
     )
     db.add(restaurant)
     db.commit()
@@ -185,13 +238,13 @@ async def update_restaurant(
     r.area = area or None
     r.address = address or None
     r.phone = phone or None
-    r.google_maps_url = google_maps_url or None
-    r.website_url = website_url or None
+    # google_maps_url / website_url have no column in the v2 schema (accepted
+    # for backward compat but not persisted).
     r.google_place_id = google_place_id or None
 
     new_image_url = await _resolve_restaurant_image(google_photo_name, image)
     if new_image_url:
-        r.image_url = new_image_url
+        r.hero_image_url = new_image_url
 
     db.commit()
     db.refresh(r)
@@ -218,7 +271,7 @@ async def update_restaurant_photo(
             detail="Provide a Google photo selection or upload an image file.",
         )
 
-    r.image_url = new_image_url
+    r.hero_image_url = new_image_url
     db.commit()
     db.refresh(r)
     return _enrich(r, db)

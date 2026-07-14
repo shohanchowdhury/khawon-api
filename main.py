@@ -1,63 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import inspect, text
-from database import engine
-import models
 
 from routers import auth, dishes, food_images, food_types, places, restaurants, reviews
 
-
-def _add_missing_columns(inspector, table, columns_to_add):
-    """Add any of columns_to_add ({name: sql_type}) missing from `table`.
-
-    Plain ADD COLUMN, no "IF NOT EXISTS" — the existence check above is
-    already the guard, and "IF NOT EXISTS" is invalid syntax on SQLite
-    (only Postgres supports it), so relying on it broke local dev DBs.
-    """
-    if table not in inspector.get_table_names():
-        return
-    existing = {col["name"] for col in inspector.get_columns(table)}
-    for col_name, col_type in columns_to_add.items():
-        if col_name not in existing:
-            with engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"))
-
-
-def run_migrations():
-    """Add new columns to existing dev databases without Alembic."""
-    inspector = inspect(engine)
-    if "reviews" not in inspector.get_table_names():
-        return
-
-    _add_missing_columns(inspector, "food_types", {
-        "image_url": "TEXT",
-        "parent_id": "INTEGER",
-    })
-    _add_missing_columns(inspector, "dishes", {
-        "canonical_dish_id": "INTEGER",
-        "is_active": "BOOLEAN DEFAULT TRUE",
-        "last_seen_at": "TIMESTAMP",
-    })
-    _add_missing_columns(inspector, "restaurants", {
-        "website_url": "TEXT",
-        "google_place_id": "VARCHAR(255)",
-        "image_url": "TEXT",
-        "match_status": "VARCHAR(20) DEFAULT 'unmatched'",
-        "source_restaurant_code": "VARCHAR(50)",
-        "chain_name": "VARCHAR(200)",
-        "chain_code": "VARCHAR(50)",
-        "budget": "INTEGER",
-        "foodpanda_rating": "FLOAT",
-        "foodpanda_review_number": "INTEGER",
-        "raw_cuisines": "JSON",
-        "logo_url": "TEXT",
-        "latitude": "FLOAT",
-        "longitude": "FLOAT",
-    })
-
-
-run_migrations()
-models.Base.metadata.create_all(bind=engine)
+# SQL-first: the database schema is created and migrated by applying
+# schema.sql (it uses Postgres-native features - PostGIS geography, generated
+# columns, GiST/trigram indexes - that don't round-trip through the ORM).
+# The app must NOT create_all() or run ad-hoc column migrations here; models.py
+# is a thin read/write mapping over the tables schema.sql already created.
 
 app = FastAPI(
     title="Khawon",
