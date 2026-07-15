@@ -27,7 +27,7 @@ import collections
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import bindparam, delete, insert, text, update
+from sqlalchemy import bindparam, delete, insert, select, text, update
 
 from database import SessionLocal
 import models
@@ -239,6 +239,23 @@ def upsert_chains(db, brands: list[dict]) -> dict[str, int]:
     return {code: existing[b["slug"]] for b in brands for code in b["member_codes"]}
 
 
+def delete_orphan_chains(db) -> int:
+    """Drop restaurant_chains rows no restaurant points at.
+
+    Brands are re-derived every load, so a previous load's rows (e.g. the
+    foodpanda-era chain_code keys) linger unreferenced once every restaurant
+    is repointed at a brand slug. Returns the number deleted."""
+    referenced = select(models.Restaurant.chain_id).where(
+        models.Restaurant.chain_id.isnot(None)
+    )
+    result = db.execute(
+        delete(models.RestaurantChain).where(
+            models.RestaurantChain.id.notin_(referenced)
+        )
+    )
+    return result.rowcount
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("products_path")          # consolidated.json
@@ -374,6 +391,11 @@ def main():
         rc_rows = [dict(t) for t in {tuple(sorted(d.items())) for d in rc_rows}]
         if rc_rows:   # rows already cleared above, so plain insert is safe
             db.execute(insert(models.RestaurantCuisine), rc_rows)
+
+        # Every restaurant now points at a brand slug, so any chain row left
+        # over from a previous load (e.g. the foodpanda-era chain_code keys) is
+        # unreferenced. Must run AFTER the restaurant upsert above.
+        stats["orphan_chains_deleted"] = delete_orphan_chains(db)
 
         _commit_phase(db, "lookups, chains, restaurants")
 
@@ -568,6 +590,7 @@ def main():
         db.close()
 
     print(f"Restaurants: {stats['rest_created']} created, {stats['rest_updated']} updated")
+    print(f"Brands: {stats['orphan_chains_deleted']} orphan chain rows deleted")
     print(f"Products: {stats['prod_created']} created, {stats['prod_updated']} updated, "
           f"{stats['prod_unchanged']} unchanged, {stats['prod_deactivated']} deactivated")
     print(f"Canonical dishes: {stats['canonical_created']} created, "
