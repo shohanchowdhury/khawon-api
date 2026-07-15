@@ -27,7 +27,10 @@ import re
 from difflib import SequenceMatcher
 
 INPUT_PATH = "v2_output/consolidated.json"
-MIN_RESTAURANTS = 2
+# Comparison is across BRANDS, not branches: the same dish at three branches of
+# one chain is not a cross-restaurant comparison, it is the same dish. Branch
+# dedupe is the chain layer's job (see bootstrap_chains.py).
+MIN_BRANDS = 2
 EXCLUDED_FOOD_TYPES = {"Set Menu"}
 FUZZY_MERGE_THRESHOLD = 0.92
 
@@ -214,7 +217,10 @@ def _merge_promoted_groups(promoted: list[tuple[tuple[str, str], list[dict]]]) -
     return merged
 
 
-def build_canonical_dishes(products: list[dict]) -> tuple[list[dict], int]:
+def build_canonical_dishes(
+    products: list[dict], code_to_brand: dict[str, str]
+) -> tuple[list[dict], int]:
+    """code_to_brand maps source_restaurant_code -> brand slug (chains.json)."""
     groups: dict[tuple[str, str], list[dict]] = collections.defaultdict(list)
     for p in products:
         if p.get("food_type") in EXCLUDED_FOOD_TYPES or p.get("food_type") is None:
@@ -224,10 +230,14 @@ def build_canonical_dishes(products: list[dict]) -> tuple[list[dict], int]:
             continue
         groups[(p["food_type"], match_key)].append(p)
 
+    def brand_of(item: dict) -> str:
+        code = item.get("source_restaurant_code")
+        # unmapped code -> treat the restaurant as its own brand
+        return code_to_brand.get(code, f"__unmapped__{code}")
+
     promoted: list[tuple[tuple[str, str], list[dict]]] = []
     for key, items in groups.items():
-        restaurants = {x.get("restaurant") for x in items}
-        if len(restaurants) >= MIN_RESTAURANTS:
+        if len({brand_of(x) for x in items}) >= MIN_BRANDS:
             promoted.append((key, items))
 
     before_merge = len(promoted)
@@ -244,7 +254,7 @@ def build_canonical_dishes(products: list[dict]) -> tuple[list[dict], int]:
         display_name = raw_names.most_common(1)[0][0]
         aliases = sorted(n for n in raw_names if n != display_name)
         prices = [x["price_bdt"] for x in items if x.get("price_bdt") is not None]
-        restaurants = sorted({x.get("restaurant") for x in items})
+        brands = sorted({brand_of(x) for x in items})
         canonical_dishes.append({
             "canonical_id": canonical_id,
             "name": display_name,
@@ -253,7 +263,7 @@ def build_canonical_dishes(products: list[dict]) -> tuple[list[dict], int]:
             "sub_type": majority([x.get("sub_type") for x in items]),
             "cuisine": majority([x.get("cuisine") for x in items]),
             "category": majority([x.get("category") for x in items]),
-            "restaurant_count": len(restaurants),
+            "restaurant_count": len(brands),  # brands, not branches
             "product_count": len(items),
             "price_min_bdt": min(prices) if prices else None,
             "price_max_bdt": max(prices) if prices else None,
@@ -266,17 +276,22 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("output_path", nargs="?", default="v2_output/canonical_dishes.json")
     parser.add_argument("--input", default=INPUT_PATH)
+    parser.add_argument("--chains", default="v2_output/chains.json",
+                        help="bootstrap_chains.py output; promotion needs brands, not branches")
     args = parser.parse_args()
 
     with open(args.input, encoding="utf-8") as fh:
         products = json.load(fh)
+    with open(args.chains, encoding="utf-8") as fh:
+        brands_json = json.load(fh)
+    code_to_brand = {code: b["slug"] for b in brands_json for code in b["member_codes"]}
 
     eligible = [
         p for p in products
         if p.get("food_type") not in EXCLUDED_FOOD_TYPES and p.get("food_type") is not None
     ]
 
-    canonical_dishes, merge_count = build_canonical_dishes(products)
+    canonical_dishes, merge_count = build_canonical_dishes(products, code_to_brand)
     linked = sum(c["product_count"] for c in canonical_dishes)
 
     with open(args.output_path, "w", encoding="utf-8") as fh:
@@ -288,7 +303,7 @@ def main() -> None:
     print(f"Set Menu (excluded):       {setmenu}")
     print(f"Eligible for canonical:    {len(eligible)}")
     print(f"Fuzzy groups merged:       {merge_count}")
-    print(f"Canonical dishes created:  {len(canonical_dishes)}")
+    print(f"Canonical dishes created:  {len(canonical_dishes)}  (2+ distinct BRANDS)")
     print(f"Products linked:           {linked} ({linked / len(eligible) * 100:.1f}% of eligible)")
     print(f"Products left unlinked:    {len(eligible) - linked} (singletons - still browsable)")
     print(f"\nWritten to: {args.output_path}")
