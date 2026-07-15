@@ -226,12 +226,27 @@ def _get_or_create_lookup(db, model, names, name_col="name"):
     return existing
 
 
+def upsert_chains(db, brands: list[dict]) -> dict[str, int]:
+    """Upsert restaurant_chains keyed by brand slug (stored in chain_code).
+    Returns {source_restaurant_code: chain_id} covering EVERY member code."""
+    existing = {c.chain_code: c.id for c in db.query(models.RestaurantChain).all()}
+    missing = [{"chain_code": b["slug"], "name": b["name"]}
+               for b in brands if b["slug"] not in existing]
+    for row in _bulk_insert_returning(db, models.RestaurantChain, missing,
+                                      models.RestaurantChain.chain_code,
+                                      models.RestaurantChain.id):
+        existing[row.chain_code] = row.id
+    return {code: existing[b["slug"]] for b in brands for code in b["member_codes"]}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("products_path")          # consolidated.json
     ap.add_argument("canonical_path")         # canonical_dishes.json
     ap.add_argument("restaurants_glob")       # glob for *_restaurants.json
     ap.add_argument("--area", default="Dhanmondi")
+    ap.add_argument("--chains", default="v2_output/chains.json",
+                    help="bootstrap_chains.py output; every restaurant gets a brand")
     args = ap.parse_args()
 
     with open(args.products_path, encoding="utf-8") as f:
@@ -283,16 +298,14 @@ def main():
                                           models.FlavorTag.slug, models.FlavorTag.id):
             fl_existing[row.slug] = row.id
 
-        # ---- Chains -----------------------------------------------------
-        chain_rows = {r["chain_code"]: r.get("chain_name") for r in restaurants
-                      if r.get("chain_code")}
-        chain_id = {r.chain_code: r.id for r in db.query(models.RestaurantChain).all()}
-        missing_chain = [{"chain_code": c, "name": n or c}
-                         for c, n in chain_rows.items() if c not in chain_id]
-        for row in _bulk_insert_returning(db, models.RestaurantChain, missing_chain,
-                                          models.RestaurantChain.chain_code,
-                                          models.RestaurantChain.id):
-            chain_id[row.chain_code] = row.id
+        # ---- Brands (chains) --------------------------------------------
+        # The source chain_code is unreliable (~21% of real brands are split or
+        # untagged), so chains.json from bootstrap_chains.py is the truth here.
+        # It covers EVERY restaurant - a standalone one is a brand of one - so
+        # downstream code can always GROUP BY chain_id with no special-casing.
+        with open(args.chains, encoding="utf-8") as f:
+            brands = json.load(f)
+        code_to_chain_id = upsert_chains(db, brands)
 
         # ---- Restaurants: upsert by source_restaurant_code --------------
         def rest_values(r):
@@ -310,7 +323,7 @@ def main():
                 "phone": r.get("phone"),
                 "city": r.get("city") or "Dhaka",
                 "area": r.get("_area") or args.area,
-                "chain_id": chain_id.get(r.get("chain_code")),
+                "chain_id": code_to_chain_id.get(r.get("source_restaurant_code")),
                 "hero_image_url": images.get("hero"),
                 "logo_image_url": images.get("logo"),
                 "google_place_id": r.get("google_place_id"),

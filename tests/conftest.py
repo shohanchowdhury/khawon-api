@@ -63,9 +63,21 @@ def temp_db():
 
 @pytest.fixture
 def db_session(temp_db):
-    """Fresh session; rolls back after each test."""
+    """Fresh session with empty data tables.
+
+    Tests commit, so a rollback alone would leak rows into the next test and
+    make results order-dependent. TRUNCATE ... CASCADE clears the graph and
+    RESTART IDENTITY keeps serial ids predictable.
+    """
+    from sqlalchemy import text
     from database import SessionLocal
     session = SessionLocal()
+    session.execute(text(
+        "TRUNCATE restaurants, restaurant_chains, products, canonical_dishes, "
+        "users, food_types, food_sub_types, cuisines, food_categories, flavor_tags "
+        "RESTART IDENTITY CASCADE"
+    ))
+    session.commit()
     yield session
     session.rollback()
     session.close()
