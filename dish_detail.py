@@ -66,6 +66,15 @@ def _flavor_tag_out(ft: models.FlavorTag) -> schemas.FlavorTagOut:
     return schemas.FlavorTagOut(id=ft.id, name=ft.label)
 
 
+def normalize_product_image_url(url: str | None) -> str | None:
+    """Fix Foodpanda URLs stored with an unresolved width template."""
+    if not url:
+        return None
+    if "?width=%s" in url:
+        return url.replace("?width=%s", "?width=400")
+    return url
+
+
 def enrich_dishes(db: Session, dishes: list[models.Product]) -> list[schemas.DishOut]:
     if not dishes:
         return []
@@ -92,7 +101,7 @@ def enrich_dishes(db: Session, dishes: list[models.Product]) -> list[schemas.Dis
                 name=d.name,
                 description=d.description,
                 price_bdt=float(d.base_price_bdt) if d.base_price_bdt is not None else None,
-                image_url=d.image_url,
+                image_url=normalize_product_image_url(d.image_url),
                 is_sold_out=d.is_sold_out,
                 is_active=d.is_active,
                 category_raw=d.category.name if d.category else None,

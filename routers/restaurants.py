@@ -146,12 +146,14 @@ def list_restaurants(db: Session = Depends(get_db)):
     return _enrich_restaurants(restaurants, db)
 
 
-@router.get("/catalogue", response_model=list[schemas.RestaurantOut])
+@router.get("/catalogue", response_model=schemas.RestaurantCatalogueResult)
 def get_restaurant_catalogue(
     q: str | None = Query(None, description="Filter by name, area, or address"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(24, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Browse all restaurants with optional text filter."""
+    """Browse restaurants with optional text filter and pagination."""
     query = db.query(models.Restaurant)
     if q:
         pattern = f"%{q}%"
@@ -162,8 +164,19 @@ def get_restaurant_catalogue(
                 models.Restaurant.address.ilike(pattern),
             )
         )
-    restaurants = query.order_by(models.Restaurant.name).all()
-    return _enrich_restaurants(restaurants, db)
+    total = query.count()
+    restaurants = (
+        query.order_by(models.Restaurant.name)
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return schemas.RestaurantCatalogueResult(
+        restaurants=_enrich_restaurants(restaurants, db),
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.get("/{restaurant_id}", response_model=schemas.RestaurantOut)

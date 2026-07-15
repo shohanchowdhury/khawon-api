@@ -317,6 +317,14 @@ class RestaurantReviewListResult(BaseModel):
     limit: int = 20
 
 
+class RestaurantCatalogueResult(BaseModel):
+    """Paginated restaurant browse list."""
+    restaurants: list[RestaurantOut] = []
+    total: int = 0
+    offset: int = 0
+    limit: int = 24
+
+
 # ── Search ───────────────────────────────────────────────────
 
 class FoodDetailResult(BaseModel):

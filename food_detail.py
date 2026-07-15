@@ -7,7 +7,7 @@ surfaced as None here so the existing contract still validates; restore them by
 re-adding columns to schema.sql if the food-type detail pages need them again.
 """
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 
 import models
@@ -87,20 +87,31 @@ def get_restaurants_for_food_type(
 
     restaurants = (
         db.query(models.Restaurant)
+        .options(
+            joinedload(models.Restaurant.chain),
+            joinedload(models.Restaurant.cuisine_links).joinedload(
+                models.RestaurantCuisine.cuisine
+            ),
+        )
         .filter(models.Restaurant.id.in_(restaurant_ids))
         .all()
     )
 
-    # local import avoids a circular import (restaurants router imports this module)
-    from routers.restaurants import build_restaurant_out
+    # local import avoids a circular import (restaurants router imports dish_detail)
+    from routers.restaurants import _food_types_for_restaurants, _restaurant_out
+
+    food_types_by_restaurant = _food_types_for_restaurants(db, restaurant_ids)
 
     results = []
     for restaurant in restaurants:
         avg_raw, review_count = rating_stats.get(restaurant.id, (None, 0))
         avg_rating = round(float(avg_raw), 1) if avg_raw else None
         results.append(
-            build_restaurant_out(
-                restaurant, db, average_rating=avg_rating, review_count=review_count or 0
+            _restaurant_out(
+                restaurant,
+                food_types_by_restaurant.get(restaurant.id, []),
+                avg_rating,
+                review_count or 0,
             )
         )
 
