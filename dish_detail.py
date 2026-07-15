@@ -12,6 +12,7 @@ from sqlalchemy import func, or_
 
 import models
 import schemas
+from product_image_pools import pick_random_url, product_image_pools
 from restaurant_reviews import resolve_display_rating, restaurant_review_stats
 
 
@@ -163,6 +164,12 @@ def _canonical_match_stats_batch(
         .all()
     }
 
+    image_pools = product_image_pools(
+        db,
+        group_column=models.Product.canonical_dish_id,
+        entity_ids=ids,
+    )
+
     results = []
     for canonical in canonicals:
         restaurant_count, dish_count, min_price, max_price = product_stats.get(
@@ -170,13 +177,15 @@ def _canonical_match_stats_batch(
             (0, 0, None, None),
         )
         avg_raw = rating_stats.get(canonical.id)
+        pool = image_pools.get(canonical.id, [])
+        image_url = pick_random_url(pool) or canonical.image_url
         results.append(
             schemas.CanonicalDishMatch(
                 id=canonical.id,
                 name=canonical.name,
                 food_type=_food_type_out(canonical.food_type),
                 aliases=canonical.aliases,
-                image_url=canonical.image_url,
+                image_url=image_url,
                 restaurant_count=restaurant_count or 0,
                 dish_count=dish_count or 0,
                 average_rating=round(float(avg_raw), 1) if avg_raw else None,
