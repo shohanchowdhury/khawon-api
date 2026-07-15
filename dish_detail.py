@@ -145,11 +145,15 @@ def _canonical_match_stats_batch(
         row[0]: (row[1], row[2], row[3], row[4])
         for row in db.query(
             models.Product.canonical_dish_id,
-            func.count(func.distinct(models.Product.restaurant_id)),
+            # Brands, not branches: three Domino's branches are one restaurant
+            # to a diner comparing prices. Branch dedupe is the chain layer's
+            # job; this layer compares ACROSS brands.
+            func.count(func.distinct(models.Restaurant.chain_id)),
             func.count(models.Product.id),
             func.min(models.Product.base_price_bdt),
             func.max(models.Product.base_price_bdt),
         )
+        .join(models.Restaurant, models.Restaurant.id == models.Product.restaurant_id)
         .filter(
             models.Product.canonical_dish_id.in_(ids),
             models.Product.is_active.is_(True),
