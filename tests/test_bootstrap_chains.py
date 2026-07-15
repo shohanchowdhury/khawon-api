@@ -75,7 +75,7 @@ def test_distinct_restaurants_do_not_false_merge():
     assert len(brands) == 2
 
 
-def test_display_name_prefers_chain_name():
+def test_display_name_strips_location_from_branch_names():
     brands = build_brands([
         _r("gs3j", "Domino's Pizza - Dhanmondi", "cu0zf", "Domino's Pizza"),
         _r("wteu", "Domino's Pizza Gulshan", "cu0zf", "Domino's Pizza"),
@@ -83,11 +83,35 @@ def test_display_name_prefers_chain_name():
     assert brands[0]["name"] == "Domino's Pizza"
 
 
-def test_display_name_falls_back_to_shortest_raw_name():
+def test_display_name_preserves_casing_and_diacritics():
+    """The grouping key is 'koi th'; the label must stay 'KOI The'-shaped."""
     brands = build_brands([
-        _r("a", "Habanero", None),
-        _r("b", "Habanero - Dhanmondi", None),
+        _r("tkhd", "KOI Thé Dhanmondi", "ct4yb"),
+        _r("askx", "KOI Thé Gulshan", "ct4yb"),
     ])
+    assert brands[0]["name"] == "KOI Thé"
+
+
+def test_display_name_ignores_chain_name_naming_a_branch_we_lack():
+    """foodpanda's chain_name says 'Rice Lab - Mirpur', but the branches are
+    Uttara and Gulshan -- Mirpur is not one of them. Branch names win."""
+    brands = build_brands([
+        _r("fejm", "Rice Lab - Uttara", "cx1ze", "Rice Lab - Mirpur"),
+        _r("vmpu", "Rice Lab - Gulshan", "cx1ze", "Rice Lab - Mirpur"),
+    ])
+    assert brands[0]["name"] == "Rice Lab"
+
+
+def test_display_name_strips_trailing_outlet_digit_and_punctuation():
+    brands = build_brands([
+        _r("s0hh", "Gloria Jean's Coffee-Gulshan 1", None),
+        _r("s5bo", "Gloria Jean's Coffee-Dhanmondi", None),
+    ])
+    assert brands[0]["name"] == "Gloria Jean's Coffee"
+
+
+def test_display_name_for_standalone_restaurant():
+    brands = build_brands([_r("a", "Habanero", None)])
     assert brands[0]["name"] == "Habanero"
 
 

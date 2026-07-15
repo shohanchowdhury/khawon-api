@@ -74,14 +74,43 @@ def brand_slug(normalized: str) -> str:
 BRAND_OVERRIDES: dict[str, str] = {}
 
 
+def strip_location(name: str) -> str:
+    """Remove the branch/location from a restaurant name, PRESERVING original
+    casing, punctuation and diacritics -- 'KOI The Dhanmondi' -> 'KOI The',
+    "Domino's Pizza - Dhanmondi" -> "Domino's Pizza".
+
+    This is normalize_brand_name's job done for humans: same area tokens, same
+    suffix rules, but the result is a label rather than a match key (the key
+    lowercases and strips punctuation, giving unusable text like 'koi th').
+    """
+    s = (name or "").strip()
+    # "Greens & Seeds - Chef's Table Dhanmondi" -> "Greens & Seeds"
+    s = re.split(r"\s+[-–—]\s+", s)[0]
+    # "Ledor- Dhanmondi" -> "Ledor"
+    s = re.split(r"[-–—]\s+", s)[0]
+    for token in AREA_TOKENS:  # longest first; case-insensitive
+        s = re.sub(rf"\b{re.escape(token)}\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s*\d+$", "", s)          # trailing outlet number ("... 1")
+    return s.strip(" -–—,").strip()
+
+
 def _display_name(members: list[dict]) -> str:
-    """Brand display name. chain_name is unreliable for GROUPING but good for
-    DISPLAY ('Domino's Pizza' beats 'Domino's Pizza Gulshan'); fall back to the
-    shortest raw name, which is usually the branch-less one."""
-    chain_names = [m.get("chain_name") for m in members if m.get("chain_name")]
-    if chain_names:
-        return collections.Counter(chain_names).most_common(1)[0][0]
-    return min((m["name"].strip() for m in members), key=len)
+    """Brand display name, derived from the BRANCH NAMES with the location
+    stripped.
+
+    The source chain_name is deliberately NOT used: it can name a branch that
+    isn't in the data at all (chain_name 'Rice Lab - Mirpur' for branches in
+    Uttara and Gulshan), and it often bakes in one area for a brand spanning
+    several ('Delifrance Gulshan Avenue' across Gulshan/Dhanmondi/Uttara).
+    Branch names agree with each other once stripped, so they self-validate.
+    """
+    cleaned = [strip_location(m["name"]) for m in members]
+    cleaned = [c for c in cleaned if c] or [m["name"].strip() for m in members]
+    # most common wins; ties break toward the shorter label
+    best = collections.Counter(cleaned).most_common()
+    top = max(c for _, c in best)
+    return min((name for name, c in best if c == top), key=len)
 
 
 def build_brands(restaurants: list[dict]) -> list[dict]:
