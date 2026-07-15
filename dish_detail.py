@@ -12,6 +12,7 @@ from sqlalchemy import func, or_
 
 import models
 import schemas
+from restaurant_reviews import resolve_display_rating, restaurant_review_stats
 
 
 def _product_query(db: Session):
@@ -26,7 +27,11 @@ def _product_query(db: Session):
 
 
 def _product_review_stats(db: Session, product_ids: list[int]) -> dict[int, tuple]:
-    """(avg_rating, review_count) per product, from product_reviews."""
+    """(avg_rating, review_count) per product, from APPROVED product_reviews.
+
+    Ratings are computed live from approved reviews (the products.rating /
+    review_count columns are reserved for future denormalization and are not
+    maintained yet - see the note in schema.sql)."""
     if not product_ids:
         return {}
     return {
@@ -36,7 +41,10 @@ def _product_review_stats(db: Session, product_ids: list[int]) -> dict[int, tupl
             func.avg(models.ProductReview.rating),
             func.count(models.ProductReview.id),
         )
-        .filter(models.ProductReview.product_id.in_(product_ids))
+        .filter(
+            models.ProductReview.product_id.in_(product_ids),
+            models.ProductReview.status == "approved",
+        )
         .group_by(models.ProductReview.product_id)
         .all()
     }
@@ -62,11 +70,20 @@ def enrich_dishes(db: Session, dishes: list[models.Product]) -> list[schemas.Dis
         return []
 
     review_stats = _product_review_stats(db, [d.id for d in dishes])
+    # Restaurant-level rating (khawon-else-foodpanda) for each dish's inline
+    # restaurant card, one grouped query for the whole batch.
+    rest_stats = restaurant_review_stats(db, list({d.restaurant_id for d in dishes}))
 
     results = []
     for d in dishes:
         avg_raw, review_count = review_stats.get(d.id, (None, 0))
         avg_rating = round(float(avg_raw), 1) if avg_raw else None
+
+        r_avg_raw, r_count = rest_stats.get(d.restaurant_id, (None, 0))
+        r_avg = round(float(r_avg_raw), 1) if r_avg_raw else None
+        r_disp, _, r_src = resolve_display_rating(
+            r_avg, r_count, d.restaurant.old_rating, d.restaurant.old_review_count
+        )
 
         results.append(
             schemas.DishOut(
@@ -90,6 +107,8 @@ def enrich_dishes(db: Session, dishes: list[models.Product]) -> list[schemas.Dis
                     address=d.restaurant.address,
                     image_url=d.restaurant.hero_image_url,
                     google_place_id=d.restaurant.google_place_id,
+                    display_rating=r_disp,
+                    display_rating_source=r_src,
                 ),
                 average_rating=avg_rating,
                 review_count=review_count or 0,
@@ -103,42 +122,83 @@ def _sort_by_rating(dishes: list[schemas.DishOut]) -> list[schemas.DishOut]:
     return dishes
 
 
-def _canonical_match_stats(db: Session, canonical: models.CanonicalDish) -> schemas.CanonicalDishMatch:
-    row = (
-        db.query(
+def _canonical_match_stats_batch(
+    db: Session,
+    canonicals: list[models.CanonicalDish],
+) -> list[schemas.CanonicalDishMatch]:
+    if not canonicals:
+        return []
+
+    ids = [canonical.id for canonical in canonicals]
+
+    product_stats = {
+        row[0]: (row[1], row[2], row[3], row[4])
+        for row in db.query(
+            models.Product.canonical_dish_id,
             func.count(func.distinct(models.Product.restaurant_id)),
             func.count(models.Product.id),
             func.min(models.Product.base_price_bdt),
             func.max(models.Product.base_price_bdt),
         )
-        .filter(models.Product.canonical_dish_id == canonical.id, models.Product.is_active.is_(True))
-        .first()
-    )
-    restaurant_count, dish_count, min_price, max_price = row or (0, 0, None, None)
+        .filter(
+            models.Product.canonical_dish_id.in_(ids),
+            models.Product.is_active.is_(True),
+        )
+        .group_by(models.Product.canonical_dish_id)
+        .all()
+    }
 
-    avg_raw = (
-        db.query(func.avg(models.ProductReview.rating))
+    rating_stats = {
+        row[0]: row[1]
+        for row in db.query(
+            models.Product.canonical_dish_id,
+            func.avg(models.ProductReview.rating),
+        )
         .join(models.Product, models.ProductReview.product_id == models.Product.id)
-        .filter(models.Product.canonical_dish_id == canonical.id)
-        .scalar()
-    )
+        .filter(
+            models.Product.canonical_dish_id.in_(ids),
+            models.ProductReview.status == "approved",
+        )
+        .group_by(models.Product.canonical_dish_id)
+        .all()
+    }
 
-    return schemas.CanonicalDishMatch(
-        id=canonical.id,
-        name=canonical.name,
-        food_type=_food_type_out(canonical.food_type),
-        aliases=canonical.aliases,
-        image_url=canonical.image_url,
-        restaurant_count=restaurant_count or 0,
-        dish_count=dish_count or 0,
-        average_rating=round(float(avg_raw), 1) if avg_raw else None,
-        min_price_bdt=float(min_price) if min_price is not None else None,
-        max_price_bdt=float(max_price) if max_price is not None else None,
-    )
+    results = []
+    for canonical in canonicals:
+        restaurant_count, dish_count, min_price, max_price = product_stats.get(
+            canonical.id,
+            (0, 0, None, None),
+        )
+        avg_raw = rating_stats.get(canonical.id)
+        results.append(
+            schemas.CanonicalDishMatch(
+                id=canonical.id,
+                name=canonical.name,
+                food_type=_food_type_out(canonical.food_type),
+                aliases=canonical.aliases,
+                image_url=canonical.image_url,
+                restaurant_count=restaurant_count or 0,
+                dish_count=dish_count or 0,
+                average_rating=round(float(avg_raw), 1) if avg_raw else None,
+                min_price_bdt=float(min_price) if min_price is not None else None,
+                max_price_bdt=float(max_price) if max_price is not None else None,
+            )
+        )
+    return results
 
 
-def search_canonical_dishes(db: Session, q: str, limit: int = 10) -> list[schemas.CanonicalDishMatch]:
-    """Canonical dishes whose name, aliases, or food type match the query."""
+def search_canonical_dishes(
+    db: Session,
+    q: str,
+    *,
+    limit: int = 10,
+) -> list[schemas.CanonicalDishMatch]:
+    """Canonical dishes whose name, aliases, or food type match the query.
+
+    This is the "compare these across restaurants" highlight strip - a small
+    capped list, not the full paginated result (that's the flat dish list from
+    search_dishes, which also surfaces single-restaurant/non-canonical dishes).
+    """
     pattern = f"%{q}%"
     q_lower = q.lower().strip()
 
@@ -149,7 +209,7 @@ def search_canonical_dishes(db: Session, q: str, limit: int = 10) -> list[schema
         .filter(or_(
             models.CanonicalDish.name.ilike(pattern),
             models.FoodType.name.ilike(pattern),
-            models.CanonicalDish.aliases.isnot(None),
+            func.array_to_string(models.CanonicalDish.aliases, " ").ilike(pattern),
         ))
         .all()
     )
@@ -162,16 +222,43 @@ def search_canonical_dishes(db: Session, q: str, limit: int = 10) -> list[schema
         return any(q_lower in (alias or "").lower() for alias in (c.aliases or []))
 
     matched = [c for c in candidates if matches(c)]
-    results = [_canonical_match_stats(db, c) for c in matched]
+    results = _canonical_match_stats_batch(db, matched)
     # Most widely available first - comparison is the point
     results.sort(key=lambda m: (-m.restaurant_count, -m.dish_count))
     return results[:limit]
 
 
-def search_dishes(db: Session, q: str) -> list[schemas.DishOut]:
+def _search_rank(name: str, q_lower: str) -> int:
+    """Relevance bucket: exact < prefix < substring < matched-via-type/canonical."""
+    n = (name or "").lower()
+    if n == q_lower:
+        return 0
+    if n.startswith(q_lower):
+        return 1
+    if q_lower in n:
+        return 2
+    return 3  # matched only through food_type / canonical name, not its own name
+
+
+def search_dishes(
+    db: Session,
+    q: str,
+    *,
+    offset: int = 0,
+    limit: int = 20,
+) -> tuple[list[schemas.DishOut], int]:
+    """Flat dish (product) matches, paginated, most-relevant first.
+
+    Includes non-canonical dishes (a dish served at only one restaurant has
+    canonical_dish_id NULL but must still be findable). Ranks candidates by a
+    lightweight (id, name) fetch and only enriches the requested page, so a
+    broad query ("chicken") doesn't eagerly join thousands of rows.
+    """
     pattern = f"%{q}%"
-    dishes = (
-        _product_query(db)
+    q_lower = q.lower().strip()
+
+    rows = (
+        db.query(models.Product.id, models.Product.name)
         .outerjoin(models.FoodType, models.Product.food_type_id == models.FoodType.id)
         .outerjoin(models.CanonicalDish, models.Product.canonical_dish_id == models.CanonicalDish.id)
         .filter(
@@ -184,10 +271,26 @@ def search_dishes(db: Session, q: str) -> list[schemas.DishOut]:
         )
         .all()
     )
-    return _sort_by_rating(enrich_dishes(db, dishes))
+
+    ordered = sorted(rows, key=lambda r: (_search_rank(r.name, q_lower), (r.name or "").lower()))
+    total = len(ordered)
+    page_ids = [r.id for r in ordered[offset : offset + limit]]
+    if not page_ids:
+        return [], total
+
+    prods = _product_query(db).filter(models.Product.id.in_(page_ids)).all()
+    by_id = {p.id: p for p in prods}
+    page = [by_id[i] for i in page_ids if i in by_id]  # preserve relevance order
+    return enrich_dishes(db, page), total
 
 
-def get_canonical_dish_comparison(db: Session, canonical_dish_id: int) -> schemas.DishCompareResult | None:
+def get_canonical_dish_comparison(
+    db: Session,
+    canonical_dish_id: int,
+    *,
+    offset: int = 0,
+    limit: int = 20,
+) -> schemas.DishCompareResult | None:
     """THE compare view: one canonical dish across every restaurant serving it."""
     canonical = (
         db.query(models.CanonicalDish)
@@ -206,6 +309,20 @@ def get_canonical_dish_comparison(db: Session, canonical_dish_id: int) -> schema
         )
         .all()
     )
+    sorted_dishes = _sort_by_rating(enrich_dishes(db, dishes))
+    total = len(sorted_dishes)
+    page = sorted_dishes[offset : offset + limit]
+
+    rated = [dish for dish in sorted_dishes if dish.average_rating is not None]
+    avg_rating = (
+        round(sum(dish.average_rating for dish in rated) / len(rated), 1)
+        if rated
+        else None
+    )
+    prices = [dish.price_bdt for dish in sorted_dishes if dish.price_bdt is not None]
+    min_price = min(prices) if prices else None
+    max_price = max(prices) if prices else None
+
     return schemas.DishCompareResult(
         canonical_dish=schemas.CanonicalDishOut(
             id=canonical.id,
@@ -214,7 +331,13 @@ def get_canonical_dish_comparison(db: Session, canonical_dish_id: int) -> schema
             aliases=canonical.aliases,
             image_url=canonical.image_url,
         ),
-        dishes=_sort_by_rating(enrich_dishes(db, dishes)),
+        dishes=page,
+        total=total,
+        offset=offset,
+        limit=limit,
+        average_rating=avg_rating,
+        min_price_bdt=min_price,
+        max_price_bdt=max_price,
     )
 
 
@@ -254,25 +377,22 @@ def review_to_out(review: models.ProductReview) -> schemas.ReviewOut:
     )
 
 
-def get_reviews_for_dish(db: Session, dish_id: int) -> list[schemas.ReviewOut]:
-    reviews = (
+def get_reviews_for_dish(
+    db: Session, dish_id: int, *, offset: int = 0, limit: int = 20
+) -> tuple[list[schemas.ReviewOut], int]:
+    base = (
         db.query(models.ProductReview)
-        .options(joinedload(models.ProductReview.product), joinedload(models.ProductReview.user))
-        .filter(models.ProductReview.product_id == dish_id)
+        .filter(
+            models.ProductReview.product_id == dish_id,
+            models.ProductReview.status == "approved",
+        )
+    )
+    total = base.order_by(None).count()
+    reviews = (
+        base.options(joinedload(models.ProductReview.product), joinedload(models.ProductReview.user))
         .order_by(models.ProductReview.created_at.desc())
+        .offset(offset)
+        .limit(limit)
         .all()
     )
-    return [review_to_out(r) for r in reviews]
-
-
-def get_reviews_for_restaurant(db: Session, restaurant_id: int) -> list[schemas.ReviewOut]:
-    """A restaurant's dish reviews = product reviews across its products."""
-    reviews = (
-        db.query(models.ProductReview)
-        .join(models.Product, models.ProductReview.product_id == models.Product.id)
-        .options(joinedload(models.ProductReview.product), joinedload(models.ProductReview.user))
-        .filter(models.Product.restaurant_id == restaurant_id)
-        .order_by(models.ProductReview.created_at.desc())
-        .all()
-    )
-    return [review_to_out(r) for r in reviews]
+    return [review_to_out(r) for r in reviews], total

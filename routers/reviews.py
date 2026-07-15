@@ -31,6 +31,11 @@ def submit_review(
         db.add(review)
     review.rating = data.rating
     review.body = data.comment
+    # Post-moderation model: reviews are visible immediately and moderated/
+    # removed reactively. Ratings + public listings read status='approved',
+    # so a later switch to strict pre-moderation just means defaulting to
+    # 'pending' here and adding a moderation queue.
+    review.status = "approved"
 
     db.commit()
     db.refresh(review)

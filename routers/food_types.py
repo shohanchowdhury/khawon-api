@@ -6,6 +6,7 @@ from sqlalchemy import func
 from auth import get_current_user
 from database import get_db
 from food_detail import build_food_detail
+from food_sub_types import build_food_sub_type_list
 import models
 import schemas
 from food_images import pop_cached_image
@@ -54,7 +55,10 @@ def _enrich_food_types(
             func.count(models.ProductReview.id),
         )
         .join(models.ProductReview, models.ProductReview.product_id == models.Product.id)
-        .filter(models.Product.food_type_id.in_(ids))
+        .filter(
+            models.Product.food_type_id.in_(ids),
+            models.ProductReview.status == "approved",
+        )
         .group_by(models.Product.food_type_id)
         .all()
     }
@@ -110,6 +114,15 @@ def get_food_catalogue(
         query = query.filter(models.FoodType.name.ilike(f"%{q}%"))
     food_types = query.order_by(models.FoodType.name).all()
     return _enrich_food_types(food_types, db)
+
+
+@router.get("/{food_type_id}/sub-types", response_model=schemas.FoodSubTypeListResult)
+def get_food_sub_types(food_type_id: int, db: Session = Depends(get_db)):
+    """Sub types under a food type with dish image pools for UI cycling."""
+    ft = db.query(models.FoodType).filter(models.FoodType.id == food_type_id).first()
+    if not ft:
+        raise HTTPException(status_code=404, detail="Food type not found")
+    return build_food_sub_type_list(db, ft)
 
 
 @router.get("/{food_type_id}/detail", response_model=schemas.FoodDetailResult)

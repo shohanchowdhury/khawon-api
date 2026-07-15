@@ -44,6 +44,19 @@ class FoodTypePopularOut(FoodTypeOut):
     average_rating: Optional[float] = None
 
 
+class FoodSubTypeOut(BaseModel):
+    id: int
+    name: str
+    food_type_id: int
+    dish_count: int
+    image_urls: list[str]
+
+
+class FoodSubTypeListResult(BaseModel):
+    food_type: FoodTypeOut
+    sub_types: list[FoodSubTypeOut]
+
+
 class FoodImageSearchResult(BaseModel):
     id: str
     image_url: str
@@ -111,6 +124,12 @@ class RestaurantOut(BaseModel):
     food_types: list[FoodTypeOut] = []
     average_rating: Optional[float] = None
     review_count: int = 0
+    # Server-resolved rating to display: khawon's own if it has reviews, else
+    # the foodpanda scraped rating as fallback. `display_rating_source` tells
+    # the UI which one it is ('khawon' | 'foodpanda' | None).
+    display_rating: Optional[float] = None
+    display_review_count: int = 0
+    display_rating_source: Optional[str] = None
 
     match_status: Optional[str] = None
     source_restaurant_code: Optional[str] = None
@@ -135,6 +154,9 @@ class RestaurantSummaryOut(BaseModel):
     address: Optional[str] = None
     image_url: Optional[str] = None
     google_place_id: Optional[str] = None
+    # Resolved restaurant rating for inline cards (khawon-else-foodpanda).
+    display_rating: Optional[float] = None
+    display_rating_source: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -231,6 +253,12 @@ class DishCompareResult(BaseModel):
     """One canonical dish compared across every restaurant serving it."""
     canonical_dish: CanonicalDishOut
     dishes: list[DishOut]
+    total: int = 0
+    offset: int = 0
+    limit: int = 20
+    average_rating: Optional[float] = None
+    min_price_bdt: Optional[float] = None
+    max_price_bdt: Optional[float] = None
 
 
 # ── Reviews ─────────────────────────────────────────────────
@@ -254,6 +282,41 @@ class ReviewOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ReviewListResult(BaseModel):
+    """Paginated dish reviews."""
+    reviews: list[ReviewOut] = []
+    total: int = 0
+    offset: int = 0
+    limit: int = 20
+
+
+class RestaurantReviewCreate(BaseModel):
+    """Restaurant-level review (overall experience), distinct from dish reviews.
+    restaurant_id comes from the path."""
+    rating: int = Field(..., ge=1, le=5)
+    comment: Optional[str] = None
+
+
+class RestaurantReviewOut(BaseModel):
+    id: int
+    restaurant_id: int
+    username: str
+    rating: int
+    comment: Optional[str] = None
+    is_verified: bool = False
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RestaurantReviewListResult(BaseModel):
+    """Paginated restaurant-level reviews."""
+    reviews: list[RestaurantReviewOut] = []
+    total: int = 0
+    offset: int = 0
+    limit: int = 20
+
+
 # ── Search ───────────────────────────────────────────────────
 
 class FoodDetailResult(BaseModel):
@@ -266,4 +329,7 @@ class DishSearchResult(BaseModel):
     (with stats), plus the flat dish matches."""
     query: str
     canonical_matches: list[CanonicalDishMatch] = []
+    total: int = 0
+    offset: int = 0
+    limit: int = 20
     dishes: list[DishOut] = []

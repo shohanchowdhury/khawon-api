@@ -30,7 +30,10 @@ def enrich_food_type(db: Session, food_type: models.FoodType) -> schemas.FoodTyp
             func.count(models.ProductReview.id),
         )
         .join(models.Product, models.ProductReview.product_id == models.Product.id)
-        .filter(models.Product.food_type_id == food_type.id)
+        .filter(
+            models.Product.food_type_id == food_type.id,
+            models.ProductReview.status == "approved",
+        )
         .first()
     )
     avg_raw, review_count = review_row if review_row else (None, 0)
@@ -76,6 +79,7 @@ def get_restaurants_for_food_type(
         .filter(
             models.Product.food_type_id == food_type_id,
             models.Product.restaurant_id.in_(restaurant_ids),
+            models.ProductReview.status == "approved",
         )
         .group_by(models.Product.restaurant_id)
         .all()

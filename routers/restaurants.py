@@ -10,7 +10,13 @@ from database import get_db
 import models
 import schemas
 from places import fetch_place_photo_bytes
-from dish_detail import get_dishes_for_restaurant, get_reviews_for_restaurant
+from dish_detail import get_dishes_for_restaurant
+from restaurant_reviews import (
+    get_reviews_for_restaurant,
+    resolve_display_rating,
+    restaurant_review_stats,
+    restaurant_review_to_out,
+)
 from storage import upload_image_bytes
 
 router = APIRouter(prefix="/restaurants", tags=["Restaurants"])
@@ -37,22 +43,9 @@ def _food_types_for_restaurants(db: Session, ids: list[int]) -> dict[int, list[m
 
 
 def _restaurant_review_stats(db: Session, ids: list[int]) -> dict[int, tuple]:
-    """A restaurant's rating = the ratings of its products' reviews (reviews are
-    dish-anchored; the restaurant link flows through the product)."""
-    if not ids:
-        return {}
-    return {
-        row[0]: (row[1], row[2])
-        for row in db.query(
-            models.Product.restaurant_id,
-            func.avg(models.ProductReview.rating),
-            func.count(models.ProductReview.id),
-        )
-        .join(models.ProductReview, models.ProductReview.product_id == models.Product.id)
-        .filter(models.Product.restaurant_id.in_(ids))
-        .group_by(models.Product.restaurant_id)
-        .all()
-    }
+    """A restaurant's rating = its approved restaurant-level reviews (overall
+    experience). Dish reviews are separate and roll up per-product, not here."""
+    return restaurant_review_stats(db, ids)
 
 
 def _restaurant_out(
@@ -61,6 +54,9 @@ def _restaurant_out(
     average_rating: float | None,
     review_count: int,
 ) -> schemas.RestaurantOut:
+    disp_rating, disp_count, disp_source = resolve_display_rating(
+        average_rating, review_count, r.old_rating, r.old_review_count
+    )
     return schemas.RestaurantOut(
         id=r.id,
         name=r.name,
@@ -75,6 +71,9 @@ def _restaurant_out(
         food_types=[schemas.FoodTypeOut(id=ft.id, name=ft.name) for ft in food_types],
         average_rating=average_rating,
         review_count=review_count,
+        display_rating=disp_rating,
+        display_review_count=disp_count,
+        display_rating_source=disp_source,
         match_status=r.match_status,
         source_restaurant_code=r.source_restaurant_code,
         chain_name=r.chain.name if r.chain else None,
@@ -299,9 +298,74 @@ def get_restaurant_dishes(restaurant_id: int, db: Session = Depends(get_db)):
     return get_dishes_for_restaurant(db, restaurant_id)
 
 
-@router.get("/{restaurant_id}/reviews", response_model=list[schemas.ReviewOut])
-def get_restaurant_reviews(restaurant_id: int, db: Session = Depends(get_db)):
+@router.get("/{restaurant_id}/reviews", response_model=schemas.RestaurantReviewListResult)
+def get_restaurant_reviews(
+    restaurant_id: int,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Restaurant-level reviews (overall experience). Dish reviews are separate,
+    served per-dish from /dishes/{id}/reviews."""
     r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Restaurant not found")
-    return get_reviews_for_restaurant(db, restaurant_id)
+    reviews, total = get_reviews_for_restaurant(db, restaurant_id, offset=offset, limit=limit)
+    return schemas.RestaurantReviewListResult(reviews=reviews, total=total, offset=offset, limit=limit)
+
+
+@router.post("/{restaurant_id}/reviews", response_model=schemas.RestaurantReviewOut, status_code=201)
+def submit_restaurant_review(
+    restaurant_id: int,
+    data: schemas.RestaurantReviewCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Review a restaurant overall (requires sign-in). One review per user per
+    restaurant - submitting again updates it."""
+    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+
+    review = (
+        db.query(models.RestaurantReview)
+        .filter(
+            models.RestaurantReview.user_id == current_user.id,
+            models.RestaurantReview.restaurant_id == restaurant_id,
+        )
+        .first()
+    )
+    if review is None:
+        review = models.RestaurantReview(restaurant_id=restaurant_id, user_id=current_user.id)
+        db.add(review)
+    review.rating = data.rating
+    review.body = data.comment
+    # Post-moderation: visible immediately, moderated reactively (see reviews.py).
+    review.status = "approved"
+
+    db.commit()
+    db.refresh(review)
+    return restaurant_review_to_out(review)
+
+
+@router.delete("/{restaurant_id}/reviews/{review_id}", status_code=204)
+def delete_restaurant_review(
+    restaurant_id: int,
+    review_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    review = (
+        db.query(models.RestaurantReview)
+        .filter(
+            models.RestaurantReview.id == review_id,
+            models.RestaurantReview.restaurant_id == restaurant_id,
+        )
+        .first()
+    )
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    if review.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own reviews")
+    db.delete(review)
+    db.commit()

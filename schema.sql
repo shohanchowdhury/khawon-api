@@ -16,7 +16,12 @@
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- fuzzy/substring name search (dish search is the core feature)
-CREATE EXTENSION IF NOT EXISTS postgis;  -- geospatial: "near me" radius / nearest-restaurant queries
+-- PostGIS ("near me" geo) is NOT required by this core schema and lives in the
+-- optional add-on schema_geo.sql (adds the extension, a generated `geog`
+-- column, and its GiST index). This keeps schema.sql portable to Postgres
+-- hosts without PostGIS (e.g. default Railway); apply schema_geo.sql only on a
+-- PostGIS-enabled DB when building the near-me feature. Raw latitude/longitude
+-- stay here for display/export regardless.
 
 -- ---------------------------------------------------------------------------
 -- Lookup / reference tables (optional normalization for filtering & analytics)
@@ -107,14 +112,8 @@ CREATE TABLE restaurants (
     address                 TEXT,
     latitude                NUMERIC(10, 8),   -- kept raw for display / export
     longitude               NUMERIC(11, 8),
-    -- Generated geography point (auto-derived from lat/long, always in sync).
-    -- This is what "near me" queries hit: ST_DWithin(geog, :me, 2000) for a
-    -- 2km radius, ORDER BY geog <-> :me for nearest-first. The plain lat/long
-    -- btree can't serve those; the GiST index below can.
-    geog                    GEOGRAPHY(Point, 4326)
-                            GENERATED ALWAYS AS (
-                              ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
-                            ) STORED,
+    -- The generated `geog GEOGRAPHY` column + GiST index for "near me" live in
+    -- the optional schema_geo.sql (needs PostGIS). Not part of the core schema.
     rating                  NUMERIC(2, 1) CHECK (rating IS NULL OR rating BETWEEN 0 AND 5),
     review_count            INTEGER NOT NULL DEFAULT 0 CHECK (review_count >= 0),
     old_rating              NUMERIC(2, 1) CHECK (old_rating IS NULL OR old_rating BETWEEN 0 AND 5),
@@ -138,7 +137,7 @@ CREATE TABLE restaurants (
 CREATE INDEX idx_restaurants_city ON restaurants(city);
 CREATE INDEX idx_restaurants_area ON restaurants(area);
 CREATE INDEX idx_restaurants_rating ON restaurants(rating DESC);
-CREATE INDEX idx_restaurants_geog ON restaurants USING GIST(geog);  -- radius / nearest queries
+-- idx_restaurants_geog (GiST on geog) lives in schema_geo.sql (needs PostGIS).
 CREATE INDEX idx_restaurants_chain ON restaurants(chain_id);
 CREATE INDEX idx_restaurants_name_trgm ON restaurants USING GIN(name gin_trgm_ops);
 
