@@ -21,6 +21,7 @@ Usage:
 
 from __future__ import annotations
 
+import collections
 import re
 
 # Area/branch tokens that appear in restaurant names but are not part of the
@@ -60,3 +61,44 @@ def brand_slug(normalized: str) -> str:
     s = normalized.replace("&", " and ")
     s = re.sub(r"[^a-z0-9]+", "-", s)
     return s.strip("-")
+
+
+# source_restaurant_code -> brand slug. One mechanism covers both directions:
+# assign the same slug to force a MERGE, a different slug to force a SPLIT.
+# Populated from the owner's one-time review of the candidate groups
+# (`python bootstrap_chains.py --review`). Empty means normalization alone was
+# correct for every group.
+BRAND_OVERRIDES: dict[str, str] = {}
+
+
+def _display_name(members: list[dict]) -> str:
+    """Brand display name. chain_name is unreliable for GROUPING but good for
+    DISPLAY ('Domino's Pizza' beats 'Domino's Pizza Gulshan'); fall back to the
+    shortest raw name, which is usually the branch-less one."""
+    chain_names = [m.get("chain_name") for m in members if m.get("chain_name")]
+    if chain_names:
+        return collections.Counter(chain_names).most_common(1)[0][0]
+    return min((m["name"].strip() for m in members), key=len)
+
+
+def build_brands(restaurants: list[dict]) -> list[dict]:
+    """Group restaurants into brands. Every restaurant lands in exactly one
+    brand; a standalone restaurant is a brand of one."""
+    groups: dict[str, list[dict]] = collections.defaultdict(list)
+    for r in restaurants:
+        code = r["source_restaurant_code"]
+        slug = BRAND_OVERRIDES.get(code) or brand_slug(normalize_brand_name(r["name"]))
+        if not slug:
+            slug = brand_slug(code)  # degenerate name -> unique brand of one
+        groups[slug].append(r)
+
+    brands = [
+        {
+            "slug": slug,
+            "name": _display_name(members),
+            "member_codes": sorted(m["source_restaurant_code"] for m in members),
+        }
+        for slug, members in groups.items()
+    ]
+    brands.sort(key=lambda b: b["slug"])
+    return brands
