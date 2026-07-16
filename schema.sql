@@ -177,6 +177,12 @@ CREATE TABLE products (
     food_type_id            SMALLINT REFERENCES food_types(id) ON DELETE SET NULL,
     food_sub_type_id        SMALLINT REFERENCES food_sub_types(id) ON DELETE SET NULL,
     canonical_dish_id       INTEGER REFERENCES canonical_dishes(id) ON DELETE SET NULL,
+    -- Match key for read-time brand grouping: the API collapses a chain's
+    -- branches into one card via (chain_id, food_type_id, normalized_name).
+    -- Written by load_batch using canonical_match_key(), the SAME function the
+    -- canonical bootstrap groups with, so both layers agree on what "the same
+    -- dish name" means (and brand dedupe inherits its spelling map).
+    normalized_name         TEXT,
     -- Menu lifecycle: a re-scrape that no longer sees this item must set
     -- is_active = FALSE, never DELETE the row - product_reviews cascades on
     -- delete, so a hard delete silently destroys user reviews on a dish
@@ -198,6 +204,7 @@ CREATE INDEX idx_products_active ON products(is_active) WHERE is_active = TRUE;
 CREATE INDEX idx_products_sold_out ON products(is_sold_out) WHERE is_sold_out = FALSE;
 CREATE INDEX idx_products_rating ON products(rating DESC);
 CREATE INDEX idx_products_name_trgm ON products USING GIN(name gin_trgm_ops);
+CREATE INDEX idx_products_normalized_name ON products(normalized_name);  -- brand grouping
 
 -- Size / option pricing (maps JSON variations[])
 -- label defaults to 'Regular' rather than allowing NULL - Postgres treats
