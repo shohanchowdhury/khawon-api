@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import auth, dishes, food_images, food_types, places, restaurants, reviews
+from routers import auth, brands, dishes, food_images, food_types, places, restaurants, reviews
 
 # SQL-first: the database schema is created and migrated by applying
 # schema.sql (it uses Postgres-native features - PostGIS geography, generated
@@ -25,6 +25,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(brands.router)
 app.include_router(food_types.router)
 app.include_router(food_images.router)
 app.include_router(places.router)
