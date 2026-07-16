@@ -12,6 +12,7 @@ from sqlalchemy import func, or_
 
 import models
 import schemas
+from brand_dishes import build_brand_dishes, dish_slug
 from product_image_pools import pick_random_url, product_image_pools
 from restaurant_reviews import resolve_display_rating, restaurant_review_stats
 
@@ -21,7 +22,8 @@ def _product_query(db: Session):
         joinedload(models.Product.food_type),
         joinedload(models.Product.category),
         joinedload(models.Product.cuisine),
-        joinedload(models.Product.restaurant),
+        # brand card needs the chain; joined here so grouping does not N+1
+        joinedload(models.Product.restaurant).joinedload(models.Restaurant.chain),
         joinedload(models.Product.variations),
         joinedload(models.Product.flavor_tag_links).joinedload(models.ProductFlavorTag.flavor_tag),
     )
@@ -268,19 +270,29 @@ def search_dishes(
     *,
     offset: int = 0,
     limit: int = 20,
-) -> tuple[list[schemas.DishOut], int]:
-    """Flat dish (product) matches, paginated, most-relevant first.
+) -> tuple[list[schemas.BrandDishOut], int]:
+    """Brand dish cards matching the query, paginated, most-relevant first.
 
-    Includes non-canonical dishes (a dish served at only one restaurant has
-    canonical_dish_id NULL but must still be findable). Ranks candidates by a
-    lightweight (id, name) fetch and only enriches the requested page, so a
-    broad query ("chicken") doesn't eagerly join thousands of rows.
+    A chain appears ONCE: its branches collapse into one card (Domino's
+    Margherita x3 branches -> 1 card with branch_count=3). Non-canonical
+    dishes are included (a dish at one restaurant has canonical_dish_id NULL
+    but must still be findable).
+
+    Ranks on a lightweight (id, name, key) fetch and only hydrates the page's
+    groups, so a broad query ("chicken") never joins thousands of rows.
     """
     pattern = f"%{q}%"
     q_lower = q.lower().strip()
 
     rows = (
-        db.query(models.Product.id, models.Product.name)
+        db.query(
+            models.Product.id,
+            models.Product.name,
+            models.Restaurant.chain_id,
+            models.Product.food_type_id,
+            models.Product.normalized_name,
+        )
+        .join(models.Restaurant, models.Restaurant.id == models.Product.restaurant_id)
         .outerjoin(models.FoodType, models.Product.food_type_id == models.FoodType.id)
         .outerjoin(models.CanonicalDish, models.Product.canonical_dish_id == models.CanonicalDish.id)
         .filter(
@@ -294,16 +306,32 @@ def search_dishes(
         .all()
     )
 
-    ordered = sorted(rows, key=lambda r: (_search_rank(r.name, q_lower), (r.name or "").lower()))
-    total = len(ordered)
-    page_ids = [r.id for r in ordered[offset : offset + limit]]
-    if not page_ids:
+    # group candidate rows into brand cards BEFORE paginating, so the page
+    # size counts cards, not branch rows
+    groups: dict[tuple, list] = {}
+    for r in rows:
+        groups.setdefault((r.chain_id, r.food_type_id, r.normalized_name), []).append(r)
+
+    def rank(key):
+        best = min(_search_rank(r.name, q_lower) for r in groups[key])
+        label = min((r.name or "").lower() for r in groups[key])
+        return (best, label)
+
+    ordered_keys = sorted(groups, key=rank)
+    total = len(ordered_keys)
+    page_keys = ordered_keys[offset : offset + limit]
+    if not page_keys:
         return [], total
 
+    page_ids = [r.id for k in page_keys for r in groups[k]]
     prods = _product_query(db).filter(models.Product.id.in_(page_ids)).all()
-    by_id = {p.id: p for p in prods}
-    page = [by_id[i] for i in page_ids if i in by_id]  # preserve relevance order
-    return enrich_dishes(db, page), total
+    cards = build_brand_dishes(db, prods)
+
+    # Restore relevance order. The card exposes `slug`, not normalized_name,
+    # so key the lookup on the slug the card will actually carry.
+    order = {(k[0], k[1], dish_slug(k[2])): i for i, k in enumerate(page_keys)}
+    cards.sort(key=lambda c: order.get((c.brand.id, c.food_type_id, c.slug), len(order)))
+    return cards, total
 
 
 def get_canonical_dish_comparison(

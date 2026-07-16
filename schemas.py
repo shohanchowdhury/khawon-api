@@ -400,10 +400,11 @@ class FoodDetailResult(BaseModel):
 
 class DishSearchResult(BaseModel):
     """The core 'search a food' response: canonical dishes to compare
-    (with stats), plus the flat dish matches."""
+    (with stats), plus paginated brand dish cards. A chain appears ONCE:
+    its branches are collapsed into a single card."""
     query: str
     canonical_matches: list[CanonicalDishMatch] = []
-    total: int = 0
+    total: int = 0        # number of brand cards, not product rows
     offset: int = 0
     limit: int = 20
-    dishes: list[DishOut] = []
+    dishes: list[BrandDishOut] = []
