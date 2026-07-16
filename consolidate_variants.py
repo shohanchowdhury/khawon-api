@@ -43,6 +43,13 @@ import glob
 import json
 import collections
 
+# Grouping key shared with the canonical bootstrap (size strip + spelling map
+# + stopword removal + sorted tokens). Using the SAME key both places means a
+# restaurant's spelling-drifted size rows ('Beef Chaap Polao Half' vs
+# 'Beef Chap Pulao - Full') merge here instead of surviving as two products
+# that only fuse later, at display time, in the brand card.
+from bootstrap_canonical_dishes import canonical_match_key
+
 # Same size vocabulary the canonical bootstrap normalizes on. Capturing group
 # so we can also EXTRACT the matched token to use as a variation label.
 # NOTE ordering/optional-s: use "pcs?"/"pieces?" (optional trailing s), NOT
@@ -117,9 +124,15 @@ def build_variations(members):
 
 
 def consolidate(products):
+    # canonical_match_key, not the local normalize_name: the local one only
+    # strips sizes/punctuation, so spelling drift (chap/chaap, polao/pulao,
+    # plural, token order) splits what is one dish at one restaurant. Grouping
+    # is still strictly per-restaurant, so the fusion risk of the looser key
+    # stays confined to a single menu -- where same-key rows really are the
+    # same dish (or foodpanda listing it twice).
     groups = collections.defaultdict(list)
     for p in products:
-        groups[(p["restaurant"], normalize_name(p["name"]))].append(p)
+        groups[(p["restaurant"], canonical_match_key(p["name"]))].append(p)
 
     out = []
     merged_groups = 0
