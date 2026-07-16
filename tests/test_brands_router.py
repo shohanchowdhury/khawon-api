@@ -1,3 +1,10 @@
+"""Brand page + brand dish detail, served under /restaurants/{chain_id}.
+
+'Restaurant' in the API means brand: {restaurant_id} in the path is the
+chain_id, and a standalone restaurant is a brand of one.
+"""
+
+
 def _seed_brand(db):
     import models
     chain = models.RestaurantChain(chain_code="domino-s-pizza", name="Domino's Pizza")
@@ -26,7 +33,7 @@ def test_brand_page_lists_branches(temp_db, db_session):
     from fastapi.testclient import TestClient
     from main import app
     chain, _ = _seed_brand(db_session)
-    body = TestClient(app).get(f"/brands/{chain.id}").json()
+    body = TestClient(app).get(f"/restaurants/{chain.id}").json()
     assert body["name"] == "Domino's Pizza"
     assert body["branch_count"] == 3
     assert len(body["branches"]) == 3
@@ -36,14 +43,14 @@ def test_brand_page_lists_branches(temp_db, db_session):
 def test_brand_page_404s_for_unknown_brand(temp_db, db_session):
     from fastapi.testclient import TestClient
     from main import app
-    assert TestClient(app).get("/brands/999999").status_code == 404
+    assert TestClient(app).get("/restaurants/999999").status_code == 404
 
 
 def test_brand_dish_detail_shows_per_branch_breakdown(temp_db, db_session):
     from fastapi.testclient import TestClient
     from main import app
     chain, ft = _seed_brand(db_session)
-    body = TestClient(app).get(f"/brands/{chain.id}/dishes/{ft.id}/margherita").json()
+    body = TestClient(app).get(f"/restaurants/{chain.id}/dishes/{ft.id}/margherita").json()
     assert body["name"] == "Margherita"
     assert body["branch_count"] == 3
     assert body["price_varies"] is True
@@ -56,4 +63,4 @@ def test_brand_dish_detail_404s_for_unknown_slug(temp_db, db_session):
     from fastapi.testclient import TestClient
     from main import app
     chain, ft = _seed_brand(db_session)
-    assert TestClient(app).get(f"/brands/{chain.id}/dishes/{ft.id}/nope").status_code == 404
+    assert TestClient(app).get(f"/restaurants/{chain.id}/dishes/{ft.id}/nope").status_code == 404

@@ -1,315 +1,167 @@
-import re
-import uuid
-from typing import Annotated
+"""Restaurant endpoints -- where 'restaurant' means BRAND.
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, or_
+Every restaurant is a brand: Bella Italia is a brand with 3 branches, a
+standalone place is a brand of one. {restaurant_id} in these paths is the
+chain_id. Branch-scoped admin operations live in routers/branches.py.
+
+The brand-dish URL carries (food_type_id, slug) instead of a serial id on
+purpose: a brand dish is a grouping, not a row, serial ids churn on every
+pipeline reload, and without food_type_id a brand's "Chicken" curry would
+collide with its "Chicken" pizza at the same URL.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+
 from auth import get_current_user
+from brand_browse import build_brand_list, matching_chain_ids
+from brand_dishes import build_brand_dishes, dish_slug
 from database import get_db
+from dish_detail import _product_query, _product_review_stats
 import models
-import schemas
-from places import fetch_place_photo_bytes
-from dish_detail import get_dishes_for_restaurant
 from restaurant_reviews import (
-    get_reviews_for_restaurant,
-    resolve_display_rating,
-    restaurant_review_stats,
+    brand_display_rating,
+    get_reviews_for_brand,
     restaurant_review_to_out,
 )
-from storage import upload_image_bytes
+import schemas
 
 router = APIRouter(prefix="/restaurants", tags=["Restaurants"])
 
 
-def _num(v):
-    return float(v) if v is not None else None
+# ---------------------------------------------------------------------------
+# Brand list (browse)
+# ---------------------------------------------------------------------------
 
-
-def _food_types_for_restaurants(db: Session, ids: list[int]) -> dict[int, list[models.FoodType]]:
-    """A restaurant's food types are derived from its active products."""
-    out: dict[int, list[models.FoodType]] = {}
-    if not ids:
-        return out
-    for restaurant_id, food_type in (
-        db.query(models.Product.restaurant_id, models.FoodType)
-        .join(models.FoodType, models.Product.food_type_id == models.FoodType.id)
-        .filter(models.Product.restaurant_id.in_(ids), models.Product.is_active.is_(True))
-        .distinct()
-        .all()
-    ):
-        out.setdefault(restaurant_id, []).append(food_type)
-    return out
-
-
-def _restaurant_review_stats(db: Session, ids: list[int]) -> dict[int, tuple]:
-    """A restaurant's rating = its approved restaurant-level reviews (overall
-    experience). Dish reviews are separate and roll up per-product, not here."""
-    return restaurant_review_stats(db, ids)
-
-
-def _restaurant_out(
-    r: models.Restaurant,
-    food_types: list[models.FoodType],
-    average_rating: float | None,
-    review_count: int,
-) -> schemas.RestaurantOut:
-    disp_rating, disp_count, disp_source = resolve_display_rating(
-        average_rating, review_count, r.old_rating, r.old_review_count
-    )
-    return schemas.RestaurantOut(
-        id=r.id,
-        name=r.name,
-        area=r.area,
-        address=r.address,
-        phone=r.phone,
-        # v2 schema has no google_maps_url / website_url columns -> None.
-        google_maps_url=None,
-        website_url=None,
-        google_place_id=r.google_place_id,
-        image_url=r.hero_image_url,
-        food_types=[schemas.FoodTypeOut(id=ft.id, name=ft.name) for ft in food_types],
-        average_rating=average_rating,
-        review_count=review_count,
-        display_rating=disp_rating,
-        display_review_count=disp_count,
-        display_rating_source=disp_source,
-        match_status=r.match_status,
-        source_restaurant_code=r.source_restaurant_code,
-        chain_name=r.chain.name if r.chain else None,
-        chain_code=r.chain.chain_code if r.chain else None,
-        budget=r.budget_tier,
-        foodpanda_rating=_num(r.old_rating),
-        foodpanda_review_number=r.old_review_count,
-        raw_cuisines=[link.cuisine.name for link in r.cuisine_links if link.cuisine],
-        logo_url=r.logo_image_url,
-        latitude=_num(r.latitude),
-        longitude=_num(r.longitude),
-    )
-
-
-def build_restaurant_out(
-    r: models.Restaurant,
-    db: Session,
-    average_rating: float | None = None,
-    review_count: int | None = None,
-) -> schemas.RestaurantOut:
-    """Single restaurant -> RestaurantOut. Rating stats are derived from its
-    products' reviews unless caller passes a scoped override."""
-    if average_rating is None and review_count is None:
-        avg_raw, review_count = _restaurant_review_stats(db, [r.id]).get(r.id, (None, 0))
-        average_rating = round(float(avg_raw), 1) if avg_raw else None
-    food_types = _food_types_for_restaurants(db, [r.id]).get(r.id, [])
-    return _restaurant_out(r, food_types, average_rating, review_count or 0)
-
-
-def _enrich_restaurants(
-    restaurants: list[models.Restaurant], db: Session
-) -> list[schemas.RestaurantOut]:
-    if not restaurants:
-        return []
-    ids = [r.id for r in restaurants]
-    review_stats = _restaurant_review_stats(db, ids)
-    food_types_by_restaurant = _food_types_for_restaurants(db, ids)
-
-    results = []
-    for r in restaurants:
-        avg_raw, review_count = review_stats.get(r.id, (None, 0))
-        avg_rating = round(float(avg_raw), 1) if avg_raw else None
-        results.append(
-            _restaurant_out(r, food_types_by_restaurant.get(r.id, []), avg_rating, review_count or 0)
-        )
-    return results
-
-
-def _enrich(restaurant: models.Restaurant, db: Session) -> schemas.RestaurantOut:
-    return _enrich_restaurants([restaurant], db)[0]
-
-
-async def _resolve_restaurant_image(
-    google_photo_name: str | None,
-    image: UploadFile | None,
-) -> str | None:
-    if image and image.filename:
-        data = await image.read()
-        return upload_image_bytes(data, folder="khawon/restaurants")
-    if google_photo_name and google_photo_name.strip():
-        photo_bytes, _ = fetch_place_photo_bytes(google_photo_name.strip(), max_width=1600)
-        return upload_image_bytes(photo_bytes, folder="khawon/restaurants")
-    return None
-
-
-@router.get("/", response_model=list[schemas.RestaurantOut])
+@router.get("/", response_model=list[schemas.BrandListOut])
 def list_restaurants(db: Session = Depends(get_db)):
-    """List all restaurants"""
-    restaurants = db.query(models.Restaurant).order_by(models.Restaurant.name).all()
-    return _enrich_restaurants(restaurants, db)
+    """All brands. Bella Italia appears once with branch_count=3."""
+    chain_ids = [row[0] for row in matching_chain_ids(db, None).all()]
+    return build_brand_list(db, chain_ids)
 
 
 @router.get("/catalogue", response_model=schemas.RestaurantCatalogueResult)
 def get_restaurant_catalogue(
-    q: str | None = Query(None, description="Filter by name, area, or address"),
+    q: str | None = Query(None, description="Filter by brand, branch, area, or address"),
     offset: int = Query(0, ge=0),
     limit: int = Query(24, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Browse restaurants with optional text filter and pagination."""
-    query = db.query(models.Restaurant)
-    if q:
-        pattern = f"%{q}%"
-        query = query.filter(
-            or_(
-                models.Restaurant.name.ilike(pattern),
-                models.Restaurant.area.ilike(pattern),
-                models.Restaurant.address.ilike(pattern),
-            )
-        )
-    total = query.count()
-    restaurants = (
-        query.order_by(models.Restaurant.name)
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
+    """Browse brands with optional text filter and pagination."""
+    rows = matching_chain_ids(db, q).all()
+    total = len(rows)
+    page_ids = [row[0] for row in rows[offset:offset + limit]]
     return schemas.RestaurantCatalogueResult(
-        restaurants=_enrich_restaurants(restaurants, db),
+        restaurants=build_brand_list(db, page_ids),
         total=total,
         offset=offset,
         limit=limit,
     )
 
 
-@router.get("/{restaurant_id}", response_model=schemas.RestaurantOut)
-def get_restaurant(restaurant_id: int, db: Session = Depends(get_db)):
-    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
-    if not r:
+# ---------------------------------------------------------------------------
+# Brand page + menu + dish detail
+# ---------------------------------------------------------------------------
+
+def _get_chain(db: Session, chain_id: int) -> models.RestaurantChain:
+    chain = db.query(models.RestaurantChain).filter(models.RestaurantChain.id == chain_id).first()
+    if not chain:
         raise HTTPException(status_code=404, detail="Restaurant not found")
-    return _enrich(r, db)
+    return chain
 
 
-@router.post("/", response_model=schemas.RestaurantOut, status_code=201)
-async def create_restaurant(
-    name: str = Form(...),
-    area: str | None = Form(None),
-    address: str | None = Form(None),
-    phone: str | None = Form(None),
-    google_maps_url: str | None = Form(None),
-    website_url: str | None = Form(None),
-    google_place_id: str | None = Form(None),
-    google_photo_name: str | None = Form(None),
-    image: UploadFile | None = File(None),
-    db: Session = Depends(get_db),
-    _current_user: models.User = Depends(get_current_user),
-):
-    """Add a new restaurant (requires sign-in). Food types are derived from
-    the restaurant's dishes, not set directly."""
-    image_url = await _resolve_restaurant_image(google_photo_name, image)
-
-    # A user-created restaurant still needs a stable natural key (schema requires
-    # source_restaurant_code NOT NULL UNIQUE); derive a slug + short unique suffix.
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "restaurant"
-    code = f"user-{slug}-{uuid.uuid4().hex[:8]}"
-
-    restaurant = models.Restaurant(
-        source_restaurant_code=code,
-        name=name,
-        area=area or None,
-        address=address or None,
-        phone=phone or None,
-        # v2 schema has no google_maps_url / website_url columns; those form
-        # fields are accepted for backward compat but not persisted.
-        google_place_id=google_place_id or None,
-        hero_image_url=image_url,
+def _branches(db: Session, chain_id: int) -> list[models.Restaurant]:
+    return (
+        db.query(models.Restaurant)
+        .filter(models.Restaurant.chain_id == chain_id, models.Restaurant.is_active.is_(True))
+        .order_by(models.Restaurant.name)
+        .all()
     )
-    db.add(restaurant)
-    db.commit()
-    db.refresh(restaurant)
-    return _enrich(restaurant, db)
 
 
-@router.put("/{restaurant_id}", response_model=schemas.RestaurantOut)
-async def update_restaurant(
-    restaurant_id: int,
-    name: str = Form(...),
-    area: str | None = Form(None),
-    address: str | None = Form(None),
-    phone: str | None = Form(None),
-    google_maps_url: str | None = Form(None),
-    website_url: str | None = Form(None),
-    google_place_id: str | None = Form(None),
-    google_photo_name: str | None = Form(None),
-    image: UploadFile | None = File(None),
-    db: Session = Depends(get_db),
-    _current_user: models.User = Depends(get_current_user),
-):
-    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
-
-    r.name = name
-    r.area = area or None
-    r.address = address or None
-    r.phone = phone or None
-    # google_maps_url / website_url have no column in the v2 schema (accepted
-    # for backward compat but not persisted).
-    r.google_place_id = google_place_id or None
-
-    new_image_url = await _resolve_restaurant_image(google_photo_name, image)
-    if new_image_url:
-        r.hero_image_url = new_image_url
-
-    db.commit()
-    db.refresh(r)
-    return _enrich(r, db)
+@router.get("/{restaurant_id}", response_model=schemas.BrandDetailOut)
+def get_restaurant(restaurant_id: int, db: Session = Depends(get_db)):
+    """The brand page: locations as tags, pooled display rating."""
+    chain = _get_chain(db, restaurant_id)
+    branches = _branches(db, restaurant_id)
+    rating, _count, source = brand_display_rating(db, branches)
+    return schemas.BrandDetailOut(
+        id=chain.id,
+        name=chain.name,
+        branch_count=len(branches),
+        branches=[
+            schemas.RestaurantSummaryOut(
+                id=b.id, name=b.name, area=b.area, address=b.address,
+                image_url=b.hero_image_url, google_place_id=b.google_place_id,
+            )
+            for b in branches
+        ],
+        display_rating=rating,
+        display_rating_source=source,
+    )
 
 
-@router.put("/{restaurant_id}/photo", response_model=schemas.RestaurantOut)
-async def update_restaurant_photo(
-    restaurant_id: int,
-    google_photo_name: Annotated[str | None, Form()] = None,
-    image: UploadFile | None = File(None),
-    db: Session = Depends(get_db),
-    _current_user: models.User = Depends(get_current_user),
-):
-    """Update only the restaurant photo from Google or a file upload."""
-    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
-
-    new_image_url = await _resolve_restaurant_image(google_photo_name, image)
-    if not new_image_url:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide a Google photo selection or upload an image file.",
+@router.get("/{restaurant_id}/menu", response_model=list[schemas.BrandDishOut])
+def get_restaurant_menu(restaurant_id: int, db: Session = Depends(get_db)):
+    """The brand's merged menu: union of every branch's dishes, deduped into
+    brand cards ('at 2 of 3 branches' when availability differs). One menu for
+    the whole chain -- a standalone restaurant's menu is unchanged in shape."""
+    _get_chain(db, restaurant_id)
+    products = (
+        _product_query(db)
+        .join(models.Restaurant, models.Restaurant.id == models.Product.restaurant_id)
+        .filter(
+            models.Restaurant.chain_id == restaurant_id,
+            models.Product.is_active.is_(True),
         )
-
-    r.hero_image_url = new_image_url
-    db.commit()
-    db.refresh(r)
-    return _enrich(r, db)
-
-
-@router.delete("/{restaurant_id}", status_code=204)
-def delete_restaurant(
-    restaurant_id: int,
-    db: Session = Depends(get_db),
-    _current_user: models.User = Depends(get_current_user),
-):
-    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
-    db.delete(r)
-    db.commit()
+        .all()
+    )
+    cards = build_brand_dishes(db, products)
+    cards.sort(key=lambda c: ((c.category_raw or ""), c.name.lower()))
+    return cards
 
 
-@router.get("/{restaurant_id}/dishes", response_model=list[schemas.DishOut])
-def get_restaurant_dishes(restaurant_id: int, db: Session = Depends(get_db)):
-    """A restaurant's menu (dishes)."""
-    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
-    return get_dishes_for_restaurant(db, restaurant_id)
+@router.get("/{restaurant_id}/dishes/{food_type_id}/{slug}", response_model=schemas.BrandDishDetailOut)
+def get_restaurant_dish(restaurant_id: int, food_type_id: int, slug: str, db: Session = Depends(get_db)):
+    """One brand dish with the per-branch breakdown (each branch's price and
+    its own product_id -- which is what POST /reviews takes for dish reviews)."""
+    products = [
+        p for p in (
+            _product_query(db)
+            .join(models.Restaurant, models.Restaurant.id == models.Product.restaurant_id)
+            .filter(
+                models.Restaurant.chain_id == restaurant_id,
+                models.Product.food_type_id == food_type_id,
+                models.Product.is_active.is_(True),
+            )
+            .all()
+        )
+        if dish_slug(p.normalized_name) == slug
+    ]
+    if not products:
+        raise HTTPException(status_code=404, detail="Dish not found")
 
+    card = build_brand_dishes(db, products)[0]
+    stats = _product_review_stats(db, [p.id for p in products])
+    branches = []
+    for p in sorted(products, key=lambda x: x.restaurant.name):
+        avg_raw, n = stats.get(p.id, (None, 0))
+        branches.append(schemas.BrandBranchOut(
+            restaurant_id=p.restaurant.id,
+            restaurant_name=p.restaurant.name,
+            area=p.restaurant.area,
+            product_id=p.id,
+            price_bdt=float(p.base_price_bdt),
+            is_sold_out=p.is_sold_out,
+            average_rating=round(float(avg_raw), 1) if avg_raw else None,
+            review_count=n or 0,
+        ))
+    return schemas.BrandDishDetailOut(**card.model_dump(), branches=branches)
+
+
+# ---------------------------------------------------------------------------
+# Location reviews (attach to a branch, pool per brand)
+# ---------------------------------------------------------------------------
 
 @router.get("/{restaurant_id}/reviews", response_model=schemas.RestaurantReviewListResult)
 def get_restaurant_reviews(
@@ -318,12 +170,11 @@ def get_restaurant_reviews(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Restaurant-level reviews (overall experience). Dish reviews are separate,
+    """Location reviews pooled across the brand's branches, newest first. Each
+    review is tagged with its branch name/area. Dish reviews are separate,
     served per-dish from /dishes/{id}/reviews."""
-    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
-    reviews, total = get_reviews_for_restaurant(db, restaurant_id, offset=offset, limit=limit)
+    _get_chain(db, restaurant_id)
+    reviews, total = get_reviews_for_brand(db, restaurant_id, offset=offset, limit=limit)
     return schemas.RestaurantReviewListResult(reviews=reviews, total=total, offset=offset, limit=limit)
 
 
@@ -334,22 +185,24 @@ def submit_restaurant_review(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Review a restaurant overall (requires sign-in). One review per user per
-    restaurant - submitting again updates it."""
-    r = db.query(models.Restaurant).filter(models.Restaurant.id == restaurant_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
+    """Review a LOCATION of this brand (requires sign-in). branch_id picks
+    which location the reviewer visited; one review per user per location,
+    resubmitting updates it. The brand page shows the pooled rating."""
+    _get_chain(db, restaurant_id)
+    branch = db.query(models.Restaurant).filter(models.Restaurant.id == data.branch_id).first()
+    if not branch or branch.chain_id != restaurant_id:
+        raise HTTPException(status_code=400, detail="branch_id is not a location of this restaurant")
 
     review = (
         db.query(models.RestaurantReview)
         .filter(
             models.RestaurantReview.user_id == current_user.id,
-            models.RestaurantReview.restaurant_id == restaurant_id,
+            models.RestaurantReview.restaurant_id == data.branch_id,
         )
         .first()
     )
     if review is None:
-        review = models.RestaurantReview(restaurant_id=restaurant_id, user_id=current_user.id)
+        review = models.RestaurantReview(restaurant_id=data.branch_id, user_id=current_user.id)
         db.add(review)
     review.rating = data.rating
     review.body = data.comment
@@ -370,9 +223,10 @@ def delete_restaurant_review(
 ):
     review = (
         db.query(models.RestaurantReview)
+        .join(models.Restaurant, models.Restaurant.id == models.RestaurantReview.restaurant_id)
         .filter(
             models.RestaurantReview.id == review_id,
-            models.RestaurantReview.restaurant_id == restaurant_id,
+            models.Restaurant.chain_id == restaurant_id,
         )
         .first()
     )

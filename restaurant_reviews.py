@@ -34,6 +34,8 @@ def restaurant_review_to_out(review: models.RestaurantReview) -> schemas.Restaur
     return schemas.RestaurantReviewOut(
         id=review.id,
         restaurant_id=review.restaurant_id,
+        branch_name=review.restaurant.name if review.restaurant else None,
+        branch_area=review.restaurant.area if review.restaurant else None,
         username=review.user.display_name,
         rating=review.rating,
         comment=review.body,
@@ -74,10 +76,52 @@ def get_reviews_for_restaurant(
     )
     total = base.order_by(None).count()
     reviews = (
-        base.options(joinedload(models.RestaurantReview.user))
+        base.options(joinedload(models.RestaurantReview.user),
+                     joinedload(models.RestaurantReview.restaurant))
         .order_by(models.RestaurantReview.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
     )
     return [restaurant_review_to_out(r) for r in reviews], total
+
+
+def get_reviews_for_brand(
+    db: Session, chain_id: int, *, offset: int = 0, limit: int = 20
+) -> tuple[list[schemas.RestaurantReviewOut], int]:
+    """All approved location reviews across a brand's branches, newest first.
+    Each review carries its branch name/area so the UI can tag the location."""
+    base = (
+        db.query(models.RestaurantReview)
+        .join(models.Restaurant, models.Restaurant.id == models.RestaurantReview.restaurant_id)
+        .filter(
+            models.Restaurant.chain_id == chain_id,
+            models.RestaurantReview.status == "approved",
+        )
+    )
+    total = base.order_by(None).count()
+    reviews = (
+        base.options(joinedload(models.RestaurantReview.user),
+                     joinedload(models.RestaurantReview.restaurant))
+        .order_by(models.RestaurantReview.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return [restaurant_review_to_out(r) for r in reviews], total
+
+
+def brand_display_rating(db: Session, branches: list[models.Restaurant]) -> tuple:
+    """(rating, count, source) for a brand: pooled khawon location reviews if
+    any exist, else the review-count-weighted foodpanda average across
+    branches. Swaps to nearest-branch when geo lands."""
+    stats = restaurant_review_stats(db, [b.id for b in branches])
+    total_n = sum(stats.get(b.id, (None, 0))[1] or 0 for b in branches)
+    khawon_avg = (
+        round(sum(float(stats[b.id][0]) * stats[b.id][1] for b in branches if b.id in stats) / total_n, 1)
+        if total_n else None
+    )
+    fp = [(float(b.old_rating), b.old_review_count or 0) for b in branches if b.old_rating is not None]
+    fp_n = sum(n for _, n in fp)
+    fp_avg = round(sum(r * n for r, n in fp) / fp_n, 1) if fp_n else (fp[0][0] if fp else None)
+    return resolve_display_rating(khawon_avg, total_n, fp_avg, fp_n)

@@ -53,70 +53,28 @@ def enrich_food_type(db: Session, food_type: models.FoodType) -> schemas.FoodTyp
 
 def get_restaurants_for_food_type(
     db: Session, food_type_id: int
-) -> list[schemas.RestaurantOut]:
-    """Restaurants serving at least one active product of this food type, with
-    rating stats scoped to their products of this type."""
-    restaurant_ids = [
+) -> list[schemas.BrandListOut]:
+    """Brands serving at least one active product of this food type. Brand
+    cards, not branches: Bella Italia appears once even if all three branches
+    serve pizza."""
+    from brand_browse import build_brand_list  # brand_browse has no dependency back on this module
+
+    chain_ids = [
         row[0]
-        for row in db.query(models.Product.restaurant_id)
-        .filter(models.Product.food_type_id == food_type_id, models.Product.is_active.is_(True))
+        for row in db.query(models.Restaurant.chain_id)
+        .join(models.Product, models.Product.restaurant_id == models.Restaurant.id)
+        .filter(
+            models.Product.food_type_id == food_type_id,
+            models.Product.is_active.is_(True),
+            models.Restaurant.is_active.is_(True),
+        )
         .distinct()
         .all()
     ]
 
-    if not restaurant_ids:
-        return []
-
-    # Per-restaurant rating stats, scoped to this food type's products
-    rating_stats = {
-        row[0]: (row[1], row[2])
-        for row in db.query(
-            models.Product.restaurant_id,
-            func.avg(models.ProductReview.rating),
-            func.count(models.ProductReview.id),
-        )
-        .join(models.ProductReview, models.ProductReview.product_id == models.Product.id)
-        .filter(
-            models.Product.food_type_id == food_type_id,
-            models.Product.restaurant_id.in_(restaurant_ids),
-            models.ProductReview.status == "approved",
-        )
-        .group_by(models.Product.restaurant_id)
-        .all()
-    }
-
-    restaurants = (
-        db.query(models.Restaurant)
-        .options(
-            joinedload(models.Restaurant.chain),
-            joinedload(models.Restaurant.cuisine_links).joinedload(
-                models.RestaurantCuisine.cuisine
-            ),
-        )
-        .filter(models.Restaurant.id.in_(restaurant_ids))
-        .all()
-    )
-
-    # local import avoids a circular import (restaurants router imports dish_detail)
-    from routers.restaurants import _food_types_for_restaurants, _restaurant_out
-
-    food_types_by_restaurant = _food_types_for_restaurants(db, restaurant_ids)
-
-    results = []
-    for restaurant in restaurants:
-        avg_raw, review_count = rating_stats.get(restaurant.id, (None, 0))
-        avg_rating = round(float(avg_raw), 1) if avg_raw else None
-        results.append(
-            _restaurant_out(
-                restaurant,
-                food_types_by_restaurant.get(restaurant.id, []),
-                avg_rating,
-                review_count or 0,
-            )
-        )
-
-    results.sort(key=lambda x: (x.average_rating is None, -(x.average_rating or 0)))
-    return results
+    brands = build_brand_list(db, chain_ids)
+    brands.sort(key=lambda b: (b.display_rating is None, -(b.display_rating or 0), b.name.lower()))
+    return brands
 
 
 def build_food_detail(db: Session, food_type: models.FoodType) -> schemas.FoodDetailResult:

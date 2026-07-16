@@ -283,6 +283,19 @@ class BrandDishDetailOut(BrandDishOut):
     branches: list[BrandBranchOut] = []
 
 
+class BranchResolveOut(BaseModel):
+    """Resolve a branch (location) row to its brand. Used when old branch URLs
+    like /restaurant/218 need to redirect to /restaurant/{chain_id}."""
+    id: int
+    chain_id: int
+    name: str
+    area: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    google_place_id: Optional[str] = None
+    image_url: Optional[str] = None
+
+
 class BrandDetailOut(BaseModel):
     """A brand and its branches. The branch list is what the future
     map/directions view renders."""
@@ -359,14 +372,18 @@ class ReviewListResult(BaseModel):
 
 class RestaurantReviewCreate(BaseModel):
     """Restaurant-level review (overall experience), distinct from dish reviews.
-    restaurant_id comes from the path."""
+    The brand (chain) comes from the path; branch_id says WHICH location the
+    reviewer visited -- reviews attach to a location, display pools per brand."""
+    branch_id: int
     rating: int = Field(..., ge=1, le=5)
     comment: Optional[str] = None
 
 
 class RestaurantReviewOut(BaseModel):
     id: int
-    restaurant_id: int
+    restaurant_id: int              # the branch (location) reviewed
+    branch_name: Optional[str] = None
+    branch_area: Optional[str] = None
     username: str
     rating: int
     comment: Optional[str] = None
@@ -384,9 +401,25 @@ class RestaurantReviewListResult(BaseModel):
     limit: int = 20
 
 
+class BrandListOut(BaseModel):
+    """One brand in the restaurant browse list. 'Restaurant' in the API means
+    brand: Bella Italia appears ONCE with branch_count=3, not per branch. A
+    standalone restaurant is a brand of one (branch_count=1)."""
+    id: int                          # chain_id -- THE restaurant id everywhere
+    name: str
+    branch_count: int
+    areas: list[str] = []            # distinct branch areas, e.g. ["Dhanmondi", "Gulshan"]
+    image_url: Optional[str] = None
+    food_types: list[FoodTypeOut] = []
+    cuisines: list[str] = []
+    display_rating: Optional[float] = None
+    display_rating_source: Optional[str] = None
+    display_review_count: int = 0
+
+
 class RestaurantCatalogueResult(BaseModel):
-    """Paginated restaurant browse list."""
-    restaurants: list[RestaurantOut] = []
+    """Paginated brand browse list."""
+    restaurants: list[BrandListOut] = []
     total: int = 0
     offset: int = 0
     limit: int = 24
@@ -396,7 +429,7 @@ class RestaurantCatalogueResult(BaseModel):
 
 class FoodDetailResult(BaseModel):
     food_type: FoodTypePopularOut
-    restaurants: list[RestaurantOut]
+    restaurants: list[BrandListOut]   # brands serving this food type, one card per brand
 
 
 class DishSearchResult(BaseModel):
