@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import bindparam, delete, insert, select, text, update
 
+from bootstrap_canonical_dishes import canonical_match_key
 from database import SessionLocal
 import models
 
@@ -60,6 +61,10 @@ def _norm_price(value) -> float:
     return float(value)
 
 
+# NOTE: every column written by prod_values must appear in BOTH signature
+# builders below, and be SELECTed into existing_rows. A column missing here can
+# never be backfilled: the row compares equal, the write is skipped, and the
+# column stays NULL forever no matter how many times you reload.
 def _prod_signature(vals: dict) -> tuple:
     return (
         vals["restaurant_id"],
@@ -72,6 +77,7 @@ def _prod_signature(vals: dict) -> tuple:
         vals.get("cuisine_id"),
         vals.get("food_type_id"),
         vals.get("food_sub_type_id"),
+        vals.get("normalized_name"),
     )
 
 
@@ -87,6 +93,7 @@ def _prod_signature_from_row(row) -> tuple:
         row.cuisine_id,
         row.food_type_id,
         row.food_sub_type_id,
+        row.normalized_name,
     )
 
 
@@ -109,7 +116,16 @@ def _touch_batch_products(db, restaurant_ids: list[int], seen_at: datetime) -> N
 def _bulk_update_products_unnest(
     db, rows: list[dict], *, label: str, chunk_size: int = 1000
 ) -> None:
-    """Single-round-trip product updates via unnest (fast over Railway proxy)."""
+    """Single-round-trip product updates via unnest (fast over Railway proxy).
+
+    WARNING: this SQL hardcodes its column list and the unnest arrays are
+    positional. Adding a column to prod_values means touching FIVE places --
+    prod_values, _prod_signature, _prod_signature_from_row, the existing_rows
+    SELECT, and here (SET clause + CAST array + d(...) alias + params dict, all
+    in the same order). Miss this one and the load cheerfully reports "N
+    updated" while never writing the column. See
+    test_bulk_update_actually_persists_normalized_name.
+    """
     if not rows:
         return
     stmt = text(
@@ -125,6 +141,7 @@ def _bulk_update_products_unnest(
             cuisine_id = d.cuisine_id,
             food_type_id = d.food_type_id,
             food_sub_type_id = d.food_sub_type_id,
+            normalized_name = d.normalized_name,
             is_active = TRUE,
             last_seen_at = :seen_at
         FROM unnest(
@@ -138,10 +155,12 @@ def _bulk_update_products_unnest(
             CAST(:category_ids AS int[]),
             CAST(:cuisine_ids AS int[]),
             CAST(:food_type_ids AS int[]),
-            CAST(:food_sub_type_ids AS int[])
+            CAST(:food_sub_type_ids AS int[]),
+            CAST(:normalized_names AS text[])
         ) AS d(
             id, restaurant_id, name, description, base_price_bdt, image_url,
-            is_sold_out, category_id, cuisine_id, food_type_id, food_sub_type_id
+            is_sold_out, category_id, cuisine_id, food_type_id, food_sub_type_id,
+            normalized_name
         )
         WHERE p.id = d.id
         """
@@ -166,6 +185,7 @@ def _bulk_update_products_unnest(
                 "cuisine_ids": [row.get("cuisine_id") for row in chunk],
                 "food_type_ids": [row.get("food_type_id") for row in chunk],
                 "food_sub_type_ids": [row.get("food_sub_type_id") for row in chunk],
+                "normalized_names": [row.get("normalized_name") for row in chunk],
             },
         )
         _ts_log(f"{label}: {min(start + chunk_size, total)}/{total}")
@@ -406,6 +426,9 @@ def main():
                 "source_product_id": p["product_id"],
                 "restaurant_id": rid,
                 "name": p["name"],
+                # Read-time brand grouping key; same function the canonical
+                # bootstrap groups with, so both layers agree.
+                "normalized_name": canonical_match_key(p.get("name", "")),
                 "description": p.get("description"),
                 "base_price_bdt": p.get("price_bdt") or 0,
                 "image_url": p.get("image"),
@@ -434,6 +457,7 @@ def main():
             models.Product.cuisine_id,
             models.Product.food_type_id,
             models.Product.food_sub_type_id,
+            models.Product.normalized_name,
         ).all()
         existing_prod = {row.source_product_id: row.id for row in existing_rows}
         existing_sigs = {

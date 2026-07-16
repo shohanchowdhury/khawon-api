@@ -163,6 +163,9 @@ class Product(Base):
     food_type_id = Column(SmallInteger, ForeignKey("food_types.id", ondelete="SET NULL"))
     food_sub_type_id = Column(SmallInteger, ForeignKey("food_sub_types.id", ondelete="SET NULL"))
     canonical_dish_id = Column(Integer, ForeignKey("canonical_dishes.id", ondelete="SET NULL"))
+    # Read-time brand grouping key: (chain_id, food_type_id, normalized_name)
+    # collapses a chain's branches into one card. Written by load_batch.
+    normalized_name = Column(Text)
     is_active = Column(Boolean, nullable=False, server_default="true")
     last_seen_at = Column(DateTime(timezone=True), server_default=func.now())
     rating = Column(Numeric(2, 1))
