@@ -316,9 +316,10 @@ class CanonicalDishMatch(CanonicalDishOut):
 
 
 class DishCompareResult(BaseModel):
-    """One canonical dish compared across every restaurant serving it."""
+    """One canonical dish compared across every BRAND serving it. A chain is
+    one row with branch_count > 1, not one row per branch."""
     canonical_dish: CanonicalDishOut
-    dishes: list[DishOut]
+    dishes: list[BrandDishOut]
     total: int = 0
     offset: int = 0
     limit: int = 20

@@ -341,7 +341,10 @@ def get_canonical_dish_comparison(
     offset: int = 0,
     limit: int = 20,
 ) -> schemas.DishCompareResult | None:
-    """THE compare view: one canonical dish across every restaurant serving it."""
+    """THE compare view: one canonical dish across every BRAND serving it.
+    A chain is one row with branch_count > 1, not one row per branch --
+    comparing a dish to itself across branches is not a comparison, and the
+    row count now agrees with restaurant_count (which counts brands)."""
     canonical = (
         db.query(models.CanonicalDish)
         .options(joinedload(models.CanonicalDish.food_type))
@@ -351,7 +354,7 @@ def get_canonical_dish_comparison(
     if canonical is None:
         return None
 
-    dishes = (
+    products = (
         _product_query(db)
         .filter(
             models.Product.canonical_dish_id == canonical_dish_id,
@@ -359,19 +362,17 @@ def get_canonical_dish_comparison(
         )
         .all()
     )
-    sorted_dishes = _sort_by_rating(enrich_dishes(db, dishes))
-    total = len(sorted_dishes)
-    page = sorted_dishes[offset : offset + limit]
+    cards = build_brand_dishes(db, products)
+    cards.sort(key=lambda c: (c.average_rating is None, -(c.average_rating or 0)))
+    total = len(cards)
+    page = cards[offset : offset + limit]
 
-    rated = [dish for dish in sorted_dishes if dish.average_rating is not None]
+    rated = [c for c in cards if c.average_rating is not None]
     avg_rating = (
-        round(sum(dish.average_rating for dish in rated) / len(rated), 1)
-        if rated
-        else None
+        round(sum(c.average_rating for c in rated) / len(rated), 1) if rated else None
     )
-    prices = [dish.price_bdt for dish in sorted_dishes if dish.price_bdt is not None]
-    min_price = min(prices) if prices else None
-    max_price = max(prices) if prices else None
+    min_price = min((c.price_min_bdt for c in cards), default=None)
+    max_price = max((c.price_max_bdt for c in cards), default=None)
 
     return schemas.DishCompareResult(
         canonical_dish=schemas.CanonicalDishOut(
