@@ -228,6 +228,72 @@ class RestaurantWithDishesOut(RestaurantOut):
     dishes: list[DishOut] = []
 
 
+# ── Brand dish cards (a chain's branches collapsed into one card) ──
+
+class BrandOut(BaseModel):
+    id: int
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
+class BrandBranchOut(BaseModel):
+    """One branch serving a brand dish."""
+    restaurant_id: int
+    restaurant_name: str
+    area: Optional[str] = None
+    product_id: int          # the branch's own dish row; review it via POST /reviews
+    price_bdt: float
+    is_sold_out: bool = False
+    average_rating: Optional[float] = None
+    review_count: int = 0
+
+
+class BrandDishOut(BaseModel):
+    """A dish as one brand serves it, collapsing that brand's branches into a
+    single card. A standalone restaurant is a brand of one, so its card is
+    identical in shape (branch_count == brand_branch_total == 1)."""
+    brand: BrandOut
+    food_type_id: Optional[int] = None
+    slug: str                       # slugified normalized_name; with brand.id +
+                                    # food_type_id this is the card's natural key
+    name: str
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    category_raw: Optional[str] = None
+    food_type: Optional[FoodTypeOut] = None
+    cuisines: list[CuisineOut] = []
+    flavor_tags: list[FlavorTagOut] = []
+    canonical_dish_id: Optional[int] = None
+    # Always present. When price_varies is False, min == max and the UI shows
+    # one number -- one rule, no branching.
+    price_min_bdt: float
+    price_max_bdt: float
+    price_varies: bool = False
+    branch_count: int               # branches of this brand serving the dish
+    brand_branch_total: int         # branches this brand has overall
+    is_sold_out_everywhere: bool = False
+    # Pooled across the brand's branches.
+    average_rating: Optional[float] = None
+    review_count: int = 0
+
+
+class BrandDishDetailOut(BrandDishOut):
+    """Brand dish + per-branch breakdown (pooled headline, branch detail)."""
+    branches: list[BrandBranchOut] = []
+
+
+class BrandDetailOut(BaseModel):
+    """A brand and its branches. The branch list is what the future
+    map/directions view renders."""
+    id: int
+    name: str
+    branch_count: int
+    branches: list[RestaurantSummaryOut] = []
+    display_rating: Optional[float] = None
+    display_rating_source: Optional[str] = None
+
+
 # ── Canonical dishes (the unit of cross-restaurant comparison) ──
 
 class CanonicalDishOut(BaseModel):
