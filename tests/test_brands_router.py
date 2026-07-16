@@ -40,6 +40,18 @@ def test_brand_page_lists_branches(temp_db, db_session):
     assert body["display_rating_source"] == "foodpanda"  # no khawon reviews yet
 
 
+def test_brand_page_reports_the_review_count_behind_its_rating(temp_db, db_session):
+    """A rating with no count renders as '4.9 / 0 reviews', which reads broken.
+    BrandDetailOut must carry display_review_count like BrandListOut does --
+    3 branches x 100 foodpanda reviews = 300."""
+    from fastapi.testclient import TestClient
+    from main import app
+    chain, _ = _seed_brand(db_session)
+    body = TestClient(app).get(f"/restaurants/{chain.chain_code}").json()
+    assert body["display_rating"] == 4.5
+    assert body["display_review_count"] == 300, "count must match the displayed rating's source"
+
+
 def test_brand_page_404s_for_unknown_brand(temp_db, db_session):
     from fastapi.testclient import TestClient
     from main import app

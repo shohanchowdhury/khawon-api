@@ -91,12 +91,13 @@ def get_restaurant(slug: str, db: Session = Depends(get_db)):
     """The brand page: locations as tags, pooled display rating."""
     chain = _get_chain(db, slug)
     branches = _branches(db, chain.id)
-    rating, _count, source = brand_display_rating(db, branches)
+    rating, count, source = brand_display_rating(db, branches)
     return schemas.BrandDetailOut(
         id=chain.id,
         slug=chain.chain_code,
         name=chain.name,
         branch_count=len(branches),
+        display_review_count=count,
         branches=[
             schemas.RestaurantSummaryOut(
                 id=b.id, name=b.name, area=b.area, address=b.address,

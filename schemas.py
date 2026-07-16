@@ -226,6 +226,9 @@ class BrandDetailOut(BaseModel):
     branch_count: int
     branches: list[RestaurantSummaryOut] = []
     display_rating: Optional[float] = None
+    # The count BEHIND display_rating (same source). Without it the page shows
+    # a rating next to "0 reviews", which reads broken.
+    display_review_count: int = 0
     display_rating_source: Optional[str] = None
 
 
