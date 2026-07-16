@@ -15,8 +15,9 @@ import re
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlalchemy import or_
+from sqlalchemy.orm import Session, joinedload
 
 from auth import get_current_user
 from database import get_db
@@ -56,16 +57,30 @@ def _branch_out(b: models.Restaurant) -> schemas.RestaurantSummaryOut:
     )
 
 
-@router.get("/", response_model=list[schemas.RestaurantSummaryOut])
-def list_branches(db: Session = Depends(get_db)):
-    """All active locations for admin/manage screens."""
-    branches = (
-        db.query(models.Restaurant)
-        .filter(models.Restaurant.is_active.is_(True))
-        .order_by(models.Restaurant.name)
-        .all()
+@router.get("/", response_model=schemas.BranchListResult)
+def list_branches(
+    q: str | None = Query(None, description="Filter by branch name, area, or address"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Active locations for admin/manage screens, paginated."""
+    query = db.query(models.Restaurant).filter(models.Restaurant.is_active.is_(True))
+    if q:
+        pattern = f"%{q}%"
+        query = query.filter(or_(
+            models.Restaurant.name.ilike(pattern),
+            models.Restaurant.area.ilike(pattern),
+            models.Restaurant.address.ilike(pattern),
+        ))
+    total = query.count()
+    branches = query.order_by(models.Restaurant.name).offset(offset).limit(limit).all()
+    return schemas.BranchListResult(
+        branches=[_branch_out(b) for b in branches],
+        total=total,
+        offset=offset,
+        limit=limit,
     )
-    return [_branch_out(b) for b in branches]
 
 
 @router.post("/", response_model=schemas.RestaurantSummaryOut, status_code=201)
@@ -170,12 +185,21 @@ def delete_branch(
 
 @router.get("/{branch_id}", response_model=schemas.BranchResolveOut)
 def get_branch(branch_id: int, db: Session = Depends(get_db)):
-    """Resolve a location row to its brand (chain_id). Public read for URL
-    redirects and branch admin edit forms."""
-    b = _get_branch(db, branch_id)
+    """Resolve a location row to its brand. Returns chain_slug -- redirect an
+    old /restaurant/{branchId} link to /restaurants/{chain_slug}. Also backs
+    the branch admin edit form."""
+    b = (
+        db.query(models.Restaurant)
+        .options(joinedload(models.Restaurant.chain))
+        .filter(models.Restaurant.id == branch_id)
+        .first()
+    )
+    if not b:
+        raise HTTPException(status_code=404, detail="Branch not found")
     return schemas.BranchResolveOut(
         id=b.id,
         chain_id=b.chain_id,
+        chain_slug=b.chain.chain_code,
         name=b.name,
         area=b.area,
         address=b.address,

@@ -33,21 +33,15 @@ router = APIRouter(prefix="/restaurants", tags=["Restaurants"])
 # Brand list (browse)
 # ---------------------------------------------------------------------------
 
-@router.get("/", response_model=list[schemas.BrandListOut])
-def list_restaurants(db: Session = Depends(get_db)):
-    """All brands. Bella Italia appears once with branch_count=3."""
-    chain_ids = [row[0] for row in matching_chain_ids(db, None).all()]
-    return build_brand_list(db, chain_ids)
-
-
-@router.get("/catalogue", response_model=schemas.RestaurantCatalogueResult)
-def get_restaurant_catalogue(
+@router.get("/", response_model=schemas.RestaurantCatalogueResult)
+def list_restaurants(
     q: str | None = Query(None, description="Filter by brand, branch, area, or address"),
     offset: int = Query(0, ge=0),
     limit: int = Query(24, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Browse brands with optional text filter and pagination."""
+    """Browse brands: paginated, optional text filter. Bella Italia appears
+    once with branch_count=3, never as three branch rows."""
     rows = matching_chain_ids(db, q).all()
     total = len(rows)
     page_ids = [row[0] for row in rows[offset:offset + limit]]
@@ -63,8 +57,21 @@ def get_restaurant_catalogue(
 # Brand page + menu + dish detail
 # ---------------------------------------------------------------------------
 
-def _get_chain(db: Session, chain_id: int) -> models.RestaurantChain:
-    chain = db.query(models.RestaurantChain).filter(models.RestaurantChain.id == chain_id).first()
+def _get_chain(db: Session, slug: str) -> models.RestaurantChain:
+    """Resolve a brand by its slug (chain_code).
+
+    Slugs, not ids, are the URL key on purpose. restaurants.id and
+    restaurant_chains.id are separate serial sequences that OVERLAP, so a
+    numeric /restaurants/{id} silently served the WRONG brand when handed a
+    branch-row id (no 404 to catch it). A slug cannot be mistaken for either --
+    the failure mode is impossible by construction. Slugs also survive the
+    pipeline reloads that churn serial ids, so links stay valid.
+    """
+    chain = (
+        db.query(models.RestaurantChain)
+        .filter(models.RestaurantChain.chain_code == slug)
+        .first()
+    )
     if not chain:
         raise HTTPException(status_code=404, detail="Restaurant not found")
     return chain
@@ -79,14 +86,15 @@ def _branches(db: Session, chain_id: int) -> list[models.Restaurant]:
     )
 
 
-@router.get("/{restaurant_id}", response_model=schemas.BrandDetailOut)
-def get_restaurant(restaurant_id: int, db: Session = Depends(get_db)):
+@router.get("/{slug}", response_model=schemas.BrandDetailOut)
+def get_restaurant(slug: str, db: Session = Depends(get_db)):
     """The brand page: locations as tags, pooled display rating."""
-    chain = _get_chain(db, restaurant_id)
-    branches = _branches(db, restaurant_id)
+    chain = _get_chain(db, slug)
+    branches = _branches(db, chain.id)
     rating, _count, source = brand_display_rating(db, branches)
     return schemas.BrandDetailOut(
         id=chain.id,
+        slug=chain.chain_code,
         name=chain.name,
         branch_count=len(branches),
         branches=[
@@ -101,17 +109,17 @@ def get_restaurant(restaurant_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.get("/{restaurant_id}/menu", response_model=list[schemas.BrandDishOut])
-def get_restaurant_menu(restaurant_id: int, db: Session = Depends(get_db)):
+@router.get("/{slug}/menu", response_model=list[schemas.BrandDishOut])
+def get_restaurant_menu(slug: str, db: Session = Depends(get_db)):
     """The brand's merged menu: union of every branch's dishes, deduped into
     brand cards ('at 2 of 3 branches' when availability differs). One menu for
     the whole chain -- a standalone restaurant's menu is unchanged in shape."""
-    _get_chain(db, restaurant_id)
+    chain = _get_chain(db, slug)
     products = (
         _product_query(db)
         .join(models.Restaurant, models.Restaurant.id == models.Product.restaurant_id)
         .filter(
-            models.Restaurant.chain_id == restaurant_id,
+            models.Restaurant.chain_id == chain.id,
             models.Product.is_active.is_(True),
         )
         .all()
@@ -121,22 +129,23 @@ def get_restaurant_menu(restaurant_id: int, db: Session = Depends(get_db)):
     return cards
 
 
-@router.get("/{restaurant_id}/dishes/{food_type_id}/{slug}", response_model=schemas.BrandDishDetailOut)
-def get_restaurant_dish(restaurant_id: int, food_type_id: int, slug: str, db: Session = Depends(get_db)):
+@router.get("/{slug}/dishes/{food_type_id}/{dish_slug_}", response_model=schemas.BrandDishDetailOut)
+def get_restaurant_dish(slug: str, food_type_id: int, dish_slug_: str, db: Session = Depends(get_db)):
     """One brand dish with the per-branch breakdown (each branch's price and
     its own product_id -- which is what POST /reviews takes for dish reviews)."""
+    chain = _get_chain(db, slug)
     products = [
         p for p in (
             _product_query(db)
             .join(models.Restaurant, models.Restaurant.id == models.Product.restaurant_id)
             .filter(
-                models.Restaurant.chain_id == restaurant_id,
+                models.Restaurant.chain_id == chain.id,
                 models.Product.food_type_id == food_type_id,
                 models.Product.is_active.is_(True),
             )
             .all()
         )
-        if dish_slug(p.normalized_name) == slug
+        if dish_slug(p.normalized_name) == dish_slug_
     ]
     if not products:
         raise HTTPException(status_code=404, detail="Dish not found")
@@ -163,9 +172,9 @@ def get_restaurant_dish(restaurant_id: int, food_type_id: int, slug: str, db: Se
 # Location reviews (attach to a branch, pool per brand)
 # ---------------------------------------------------------------------------
 
-@router.get("/{restaurant_id}/reviews", response_model=schemas.RestaurantReviewListResult)
+@router.get("/{slug}/reviews", response_model=schemas.RestaurantReviewListResult)
 def get_restaurant_reviews(
-    restaurant_id: int,
+    slug: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -173,14 +182,14 @@ def get_restaurant_reviews(
     """Location reviews pooled across the brand's branches, newest first. Each
     review is tagged with its branch name/area. Dish reviews are separate,
     served per-dish from /dishes/{id}/reviews."""
-    _get_chain(db, restaurant_id)
-    reviews, total = get_reviews_for_brand(db, restaurant_id, offset=offset, limit=limit)
+    chain = _get_chain(db, slug)
+    reviews, total = get_reviews_for_brand(db, chain.id, offset=offset, limit=limit)
     return schemas.RestaurantReviewListResult(reviews=reviews, total=total, offset=offset, limit=limit)
 
 
-@router.post("/{restaurant_id}/reviews", response_model=schemas.RestaurantReviewOut, status_code=201)
+@router.post("/{slug}/reviews", response_model=schemas.RestaurantReviewOut, status_code=201)
 def submit_restaurant_review(
-    restaurant_id: int,
+    slug: str,
     data: schemas.RestaurantReviewCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -188,9 +197,9 @@ def submit_restaurant_review(
     """Review a LOCATION of this brand (requires sign-in). branch_id picks
     which location the reviewer visited; one review per user per location,
     resubmitting updates it. The brand page shows the pooled rating."""
-    _get_chain(db, restaurant_id)
+    chain = _get_chain(db, slug)
     branch = db.query(models.Restaurant).filter(models.Restaurant.id == data.branch_id).first()
-    if not branch or branch.chain_id != restaurant_id:
+    if not branch or branch.chain_id != chain.id:
         raise HTTPException(status_code=400, detail="branch_id is not a location of this restaurant")
 
     review = (
@@ -214,19 +223,20 @@ def submit_restaurant_review(
     return restaurant_review_to_out(review)
 
 
-@router.delete("/{restaurant_id}/reviews/{review_id}", status_code=204)
+@router.delete("/{slug}/reviews/{review_id}", status_code=204)
 def delete_restaurant_review(
-    restaurant_id: int,
+    slug: str,
     review_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    chain = _get_chain(db, slug)
     review = (
         db.query(models.RestaurantReview)
         .join(models.Restaurant, models.Restaurant.id == models.RestaurantReview.restaurant_id)
         .filter(
             models.RestaurantReview.id == review_id,
-            models.Restaurant.chain_id == restaurant_id,
+            models.Restaurant.chain_id == chain.id,
         )
         .first()
     )

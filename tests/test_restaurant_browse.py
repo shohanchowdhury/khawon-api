@@ -55,35 +55,82 @@ def test_browse_lists_brands_not_branches(temp_db, db_session):
     _brand(db_session, "niribily", "Niribily", [("n1", "Niribily", "Dhanmondi")])
 
     body = TestClient(app).get("/restaurants").json()
-    assert len(body) == 2, "3 branches + 1 solo must be exactly 2 brands"
-    bella = next(b for b in body if b["name"] == "Bella Italia")
+    assert body["total"] == 2, "3 branches + 1 solo must be exactly 2 brands"
+    bella = next(b for b in body["restaurants"] if b["name"] == "Bella Italia")
     assert bella["branch_count"] == 3
     assert bella["areas"] == ["Dhanmondi", "Gulshan", "Uttara"]
-    solo = next(b for b in body if b["name"] == "Niribily")
+    assert bella["slug"] == "bella-italia", "browse must expose the url key"
+    solo = next(b for b in body["restaurants"] if b["name"] == "Niribily")
     assert solo["branch_count"] == 1
 
 
-def test_catalogue_filters_by_brand_name_and_area(temp_db, db_session):
+def test_browse_filters_by_brand_name_and_area(temp_db, db_session):
     from fastapi.testclient import TestClient
     from main import app
     _brand(db_session, "bella-italia", "Bella Italia", [("b1", "Bella Italia - Gulshan", "Gulshan")])
     _brand(db_session, "niribily", "Niribily", [("n1", "Niribily", "Dhanmondi")])
     c = TestClient(app)
 
-    by_name = c.get("/restaurants/catalogue", params={"q": "bella"}).json()
+    by_name = c.get("/restaurants", params={"q": "bella"}).json()
     assert by_name["total"] == 1 and by_name["restaurants"][0]["name"] == "Bella Italia"
 
-    by_area = c.get("/restaurants/catalogue", params={"q": "dhanmondi"}).json()
+    by_area = c.get("/restaurants", params={"q": "dhanmondi"}).json()
     assert by_area["total"] == 1 and by_area["restaurants"][0]["name"] == "Niribily"
 
 
-def test_catalogue_paginates_brands(temp_db, db_session):
+def test_browse_paginates_brands(temp_db, db_session):
     from fastapi.testclient import TestClient
     from main import app
     for i in range(3):
         _brand(db_session, f"brand-{i}", f"Brand {i}", [(f"r{i}", f"Brand {i}", "Dhanmondi")])
-    page = TestClient(app).get("/restaurants/catalogue", params={"offset": 0, "limit": 2}).json()
+    page = TestClient(app).get("/restaurants", params={"offset": 0, "limit": 2}).json()
     assert page["total"] == 3 and len(page["restaurants"]) == 2
+
+
+def test_catalogue_endpoint_is_gone(temp_db, db_session):
+    """/restaurants/catalogue was merged into GET /restaurants. It now falls
+    through to the brand-slug route and 404s as an unknown brand."""
+    from fastapi.testclient import TestClient
+    from main import app
+    assert TestClient(app).get("/restaurants/catalogue").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Slug URLs: a branch-row id must never resolve as a brand
+# ---------------------------------------------------------------------------
+
+def test_branch_row_id_cannot_be_passed_as_a_brand(temp_db, db_session):
+    """The bug this fixes: restaurants.id and restaurant_chains.id are separate
+    overlapping sequences, so a numeric /restaurants/{id} silently served the
+    WRONG brand when given a branch-row id. With slugs it is a clean 404."""
+    from fastapi.testclient import TestClient
+    from main import app
+    chain, branches = _brand(db_session, "bella-italia", "Bella Italia",
+                             [("b1", "Bella Italia - Dhanmondi", "Dhanmondi")])
+    c = TestClient(app)
+    assert c.get(f"/restaurants/{branches[0].id}").status_code == 404
+    assert c.get(f"/restaurants/{chain.id}").status_code == 404, "chain_id is not the url key either"
+    assert c.get(f"/restaurants/{chain.chain_code}").status_code == 200
+
+
+def test_branch_resolve_gives_the_redirect_target(temp_db, db_session):
+    """Old /restaurant/{branchId} link -> /branches/{id} -> chain_slug."""
+    from fastapi.testclient import TestClient
+    from main import app
+    chain, branches = _brand(db_session, "bella-italia", "Bella Italia",
+                             [("b1", "Bella Italia - Dhanmondi", "Dhanmondi")])
+    body = TestClient(app).get(f"/branches/{branches[0].id}").json()
+    assert body["chain_slug"] == "bella-italia"
+    assert body["chain_id"] == chain.id
+
+
+def test_branches_list_is_paginated(temp_db, db_session):
+    from fastapi.testclient import TestClient
+    from main import app
+    _brand(db_session, "bella-italia", "Bella Italia",
+           [("b1", "Bella 1", "Dhanmondi"), ("b2", "Bella 2", "Gulshan"), ("b3", "Bella 3", "Uttara")])
+    page = TestClient(app).get("/branches", params={"offset": 0, "limit": 2}).json()
+    assert page["total"] == 3 and len(page["branches"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +147,7 @@ def test_brand_menu_merges_branches_without_duplicates(temp_db, db_session):
         _dish(db_session, b, "Margherita", 250)          # at all 3 branches
     _dish(db_session, branches[0], "Tiramisu", 180)      # only at one
 
-    menu = TestClient(app).get(f"/restaurants/{chain.id}/menu").json()
+    menu = TestClient(app).get(f"/restaurants/{chain.chain_code}/menu").json()
     assert len(menu) == 2, "3x Margherita must collapse to one card"
     margherita = next(m for m in menu if m["name"] == "Margherita")
     assert margherita["branch_count"] == 3 and margherita["brand_branch_total"] == 3
@@ -121,12 +168,12 @@ def test_review_requires_branch_of_this_brand(temp_db, db_session):
     c = TestClient(app)
     H = _register(c)
 
-    ok = c.post(f"/restaurants/{chain.id}/reviews",
+    ok = c.post(f"/restaurants/{chain.chain_code}/reviews",
                 json={"branch_id": branches[0].id, "rating": 5, "comment": "great"}, headers=H)
     assert ok.status_code == 201
     assert ok.json()["branch_name"] == "Bella 1"
 
-    wrong = c.post(f"/restaurants/{chain.id}/reviews",
+    wrong = c.post(f"/restaurants/{chain.chain_code}/reviews",
                    json={"branch_id": other_branches[0].id, "rating": 1}, headers=H)
     assert wrong.status_code == 400, "a branch of another brand must be rejected"
 
@@ -140,16 +187,16 @@ def test_brand_reviews_pool_across_branches_with_branch_tags(temp_db, db_session
     c = TestClient(app)
     h1 = _register(c, "a@x.com", "usera")
     h2 = _register(c, "b@x.com", "userb")
-    c.post(f"/restaurants/{chain.id}/reviews",
+    c.post(f"/restaurants/{chain.chain_code}/reviews",
            json={"branch_id": branches[0].id, "rating": 5}, headers=h1)
-    c.post(f"/restaurants/{chain.id}/reviews",
+    c.post(f"/restaurants/{chain.chain_code}/reviews",
            json={"branch_id": branches[1].id, "rating": 3}, headers=h2)
 
-    body = c.get(f"/restaurants/{chain.id}/reviews").json()
+    body = c.get(f"/restaurants/{chain.chain_code}/reviews").json()
     assert body["total"] == 2
     assert {r["branch_name"] for r in body["reviews"]} == {"Bella Dhanmondi", "Bella Gulshan"}
 
-    page = c.get(f"/restaurants/{chain.id}").json()
+    page = c.get(f"/restaurants/{chain.chain_code}").json()
     assert page["display_rating"] == 4.0
     assert page["display_rating_source"] == "khawon"
 
@@ -161,8 +208,8 @@ def test_one_review_per_user_per_location_upserts(temp_db, db_session):
                              [("b1", "Bella 1", "Dhanmondi")])
     c = TestClient(app)
     H = _register(c)
-    c.post(f"/restaurants/{chain.id}/reviews", json={"branch_id": branches[0].id, "rating": 5}, headers=H)
-    c.post(f"/restaurants/{chain.id}/reviews", json={"branch_id": branches[0].id, "rating": 2}, headers=H)
-    body = c.get(f"/restaurants/{chain.id}/reviews").json()
+    c.post(f"/restaurants/{chain.chain_code}/reviews", json={"branch_id": branches[0].id, "rating": 5}, headers=H)
+    c.post(f"/restaurants/{chain.chain_code}/reviews", json={"branch_id": branches[0].id, "rating": 2}, headers=H)
+    body = c.get(f"/restaurants/{chain.chain_code}/reviews").json()
     assert body["total"] == 1
     assert body["reviews"][0]["rating"] == 2

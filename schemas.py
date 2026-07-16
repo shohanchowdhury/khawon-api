@@ -25,10 +25,6 @@ class Token(BaseModel):
 
 # ── Food Types ──────────────────────────────────────────────
 
-class FoodTypeCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
-
 class FoodTypeOut(BaseModel):
     id: int
     name: str
@@ -88,64 +84,6 @@ class FlavorTagOut(BaseModel):
 
 # ── Restaurants ─────────────────────────────────────────────
 
-class RestaurantCreate(BaseModel):
-    name: str
-    area: Optional[str] = None
-    address: Optional[str] = None
-    phone: Optional[str] = None
-    google_maps_url: Optional[str] = None
-    website_url: Optional[str] = None
-    google_place_id: Optional[str] = None
-    google_photo_name: Optional[str] = None
-
-    # Scrape-sourced fields (all optional — populated by the data pipeline loader, not the admin form)
-    match_status: Optional[str] = None
-    source_restaurant_code: Optional[str] = None
-    chain_name: Optional[str] = None
-    chain_code: Optional[str] = None
-    budget: Optional[int] = None
-    foodpanda_rating: Optional[float] = None
-    foodpanda_review_number: Optional[int] = None
-    raw_cuisines: Optional[list[str]] = None
-    logo_url: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-
-class RestaurantOut(BaseModel):
-    id: int
-    name: str
-    area: Optional[str]
-    address: Optional[str]
-    phone: Optional[str]
-    google_maps_url: Optional[str]
-    website_url: Optional[str] = None
-    google_place_id: Optional[str] = None
-    image_url: Optional[str] = None
-    food_types: list[FoodTypeOut] = []
-    average_rating: Optional[float] = None
-    review_count: int = 0
-    # Server-resolved rating to display: khawon's own if it has reviews, else
-    # the foodpanda scraped rating as fallback. `display_rating_source` tells
-    # the UI which one it is ('khawon' | 'foodpanda' | None).
-    display_rating: Optional[float] = None
-    display_review_count: int = 0
-    display_rating_source: Optional[str] = None
-
-    match_status: Optional[str] = None
-    source_restaurant_code: Optional[str] = None
-    chain_name: Optional[str] = None
-    chain_code: Optional[str] = None
-    budget: Optional[int] = None
-    foodpanda_rating: Optional[float] = None
-    foodpanda_review_number: Optional[int] = None
-    raw_cuisines: Optional[list[str]] = None
-    logo_url: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-
-    model_config = {"from_attributes": True}
-
-
 class RestaurantSummaryOut(BaseModel):
     """Lightweight restaurant shape for embedding inside dish search results."""
     id: int
@@ -187,22 +125,6 @@ class DishVariationOut(BaseModel):
     price_bdt: Optional[float] = None
 
 
-class DishCreate(BaseModel):
-    restaurant_id: int
-    food_type_id: Optional[int] = None
-    source_dish_id: Optional[int] = None
-    name: str
-    description: Optional[str] = None
-    price_bdt: Optional[float] = None
-    image_url: Optional[str] = None
-    is_sold_out: bool = False
-    category_raw: Optional[str] = None
-    dietary_attributes_raw: Optional[list[str]] = None
-    variations: Optional[list[DishVariationOut]] = None
-    cuisine_ids: list[int] = []
-    flavor_tag_ids: list[int] = []
-
-
 class DishOut(BaseModel):
     id: int
     name: str
@@ -224,14 +146,11 @@ class DishOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class RestaurantWithDishesOut(RestaurantOut):
-    dishes: list[DishOut] = []
-
-
 # ── Brand dish cards (a chain's branches collapsed into one card) ──
 
 class BrandOut(BaseModel):
-    id: int
+    id: int                          # chain_id -- use for POST bodies, never in a URL
+    slug: str                        # chain_code -- THE url key: /restaurants/{slug}
     name: str
 
     model_config = {"from_attributes": True}
@@ -284,10 +203,12 @@ class BrandDishDetailOut(BrandDishOut):
 
 
 class BranchResolveOut(BaseModel):
-    """Resolve a branch (location) row to its brand. Used when old branch URLs
-    like /restaurant/218 need to redirect to /restaurant/{chain_id}."""
+    """Resolve a branch (location) row to its brand. Used when an old branch URL
+    like /restaurant/218 needs to redirect to /restaurant/{chain_slug}, and by
+    the branch admin edit form."""
     id: int
     chain_id: int
+    chain_slug: str                  # redirect target: /restaurants/{chain_slug}
     name: str
     area: Optional[str] = None
     address: Optional[str] = None
@@ -299,7 +220,8 @@ class BranchResolveOut(BaseModel):
 class BrandDetailOut(BaseModel):
     """A brand and its branches. The branch list is what the future
     map/directions view renders."""
-    id: int
+    id: int                          # chain_id -- use for POST bodies, never in a URL
+    slug: str                        # chain_code -- this page's url key
     name: str
     branch_count: int
     branches: list[RestaurantSummaryOut] = []
@@ -405,7 +327,8 @@ class BrandListOut(BaseModel):
     """One brand in the restaurant browse list. 'Restaurant' in the API means
     brand: Bella Italia appears ONCE with branch_count=3, not per branch. A
     standalone restaurant is a brand of one (branch_count=1)."""
-    id: int                          # chain_id -- THE restaurant id everywhere
+    id: int                          # chain_id -- use for POST bodies, never in a URL
+    slug: str                        # chain_code -- link here: /restaurants/{slug}
     name: str
     branch_count: int
     areas: list[str] = []            # distinct branch areas, e.g. ["Dhanmondi", "Gulshan"]
@@ -418,11 +341,19 @@ class BrandListOut(BaseModel):
 
 
 class RestaurantCatalogueResult(BaseModel):
-    """Paginated brand browse list."""
+    """Paginated brand browse list -- the response of GET /restaurants."""
     restaurants: list[BrandListOut] = []
     total: int = 0
     offset: int = 0
     limit: int = 24
+
+
+class BranchListResult(BaseModel):
+    """Paginated location list (admin/manage screens)."""
+    branches: list[RestaurantSummaryOut] = []
+    total: int = 0
+    offset: int = 0
+    limit: int = 50
 
 
 # ── Search ───────────────────────────────────────────────────

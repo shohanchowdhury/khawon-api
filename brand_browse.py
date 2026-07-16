@@ -61,9 +61,11 @@ def build_brand_list(db: Session, chain_ids: list[int]) -> list[schemas.BrandLis
         if not branches:
             continue
         rating, count, source = brand_display_rating(db, branches)
+        chain = chains.get(chain_id)
         out.append(schemas.BrandListOut(
             id=chain_id,
-            name=chains[chain_id].name if chain_id in chains else branches[0].name,
+            slug=chain.chain_code if chain else str(chain_id),
+            name=chain.name if chain else branches[0].name,
             branch_count=len(branches),
             areas=sorted({b.area for b in branches if b.area}),
             image_url=next((b.hero_image_url for b in branches if b.hero_image_url), None),

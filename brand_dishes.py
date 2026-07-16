@@ -80,7 +80,11 @@ def build_brand_dishes(db: Session, products: list[models.Product]) -> list[sche
         display = collections.Counter(m.name.strip() for m in members).most_common(1)[0][0]
         first = members[0]
         cards.append(schemas.BrandDishOut(
-            brand=schemas.BrandOut(id=chain_id, name=first.restaurant.chain.name),
+            brand=schemas.BrandOut(
+                id=chain_id,
+                slug=first.restaurant.chain.chain_code,
+                name=first.restaurant.chain.name,
+            ),
             food_type_id=food_type_id,
             slug=dish_slug(normalized_name),
             name=display,
