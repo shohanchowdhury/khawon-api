@@ -1,205 +1,237 @@
-# Khawon Backend — Database, Schema & Architecture Reference
+# Khawon Backend — Database, Schema & Algorithms
 
-**Written:** 2026-07-17 · **Audience:** co-creators who already know the product idea.
-**What this is:** the complete technical explanation of how the backend is structured — every table, every column, every API type, and the reasoning behind the design. Everything below was verified against the source code and the live Railway database on the date above, not written from memory.
+**Written:** 2026-07-17 · **Audience:** co-creators who already know the product.
+**What this is:** how the backend is structured — every table, every column, and the algorithms that turn a foodpanda scrape into "search a dish, compare it across restaurants." Everything here was verified against the source code and the live Railway database on the date above.
 
-**Companion docs:**
-- [`HANDOFF.md`](HANDOFF.md) — the operational handoff: how to run things, the 7 debugging traps (§9 there — read them before touching `load_batch.py`), pipeline re-run commands.
-- [`docs/superpowers/specs/2026-07-15-chain-brand-model-design.md`](superpowers/specs/2026-07-15-chain-brand-model-design.md) — the brand-model design decisions (D1–D14) with the data that motivated each one.
+**How to read it:** §1 is the vocabulary — 3 minutes, and nothing else parses without it. §2 is the complete schema. §3 is the algorithms, and ends with [§3.6](#36-end-to-end-a-real-dish-through-the-whole-system), a real dish traced through the entire system. §4 onward is supporting reference.
 
----
-
-## Table of contents
-
-1. [The system at a glance](#1-the-system-at-a-glance)
-2. [Core concepts & vocabulary](#2-core-concepts--vocabulary)
-3. [Design principles — why it's built this way](#3-design-principles)
-4. [The database — all 20 tables](#4-the-database)
-5. [The Python layer — `database.py`, `models.py`, `schemas.py`](#5-the-python-layer)
-6. [How data gets IN — the pipeline](#6-how-data-gets-in--the-pipeline)
-7. [How data gets OUT — read-time assembly](#7-how-data-gets-out--read-time-assembly)
-8. [API endpoint reference](#8-api-endpoint-reference)
-9. [Auth](#9-auth)
-10. [External services & environment variables](#10-external-services--environment-variables)
-11. [Testing](#11-testing)
-12. [Known gaps & deferred work](#12-known-gaps--deferred-work)
+**Companion docs:** [`HANDOFF.md`](HANDOFF.md) — how to run things + 7 debugging traps (read §9 there before touching `load_batch.py`). [`specs/2026-07-15-chain-brand-model-design.md`](superpowers/specs/2026-07-15-chain-brand-model-design.md) — brand-model decisions D1–D14 with the data behind them.
 
 ---
 
-## 1. The system at a glance
+## Contents
 
-```
-  foodpanda scrape (one-time / re-runnable)
-        │
-        ▼
-  ┌────────────── OFFLINE PIPELINE (deterministic, re-runnable) ──────────────┐
-  │ strip_restaurants.py   raw scrape → restaurants_<area>_partN.json         │
-  │ classify_batch.py      → *_products.json + *_restaurants.json (taxonomy)  │
-  │ consolidate_variants.py→ consolidated.json  (size-row merge)              │
-  │ bootstrap_chains.py    → chains.json        (BRAND identity)              │
-  │ bootstrap_canonical_dishes.py → canonical_dishes.json (COMPARE layer)     │
-  └──────────────────────────────┬────────────────────────────────────────────┘
-                                 │  load_batch.py (idempotent upsert)
-                                 ▼
-                     PostgreSQL 18 on Railway
-                     (schema.sql = source of truth; pg_trgm; no PostGIS)
-                                 │
-                                 ▼
-                     FastAPI  (main.py + routers/*)
-                     — all aggregation happens at READ time —
-                                 ▼
-                     React 19 + Vite  (khawon-web, mirrors schemas.py in TS)
-```
+**Part I — The data**
+1. [Vocabulary & the two-layer model](#1-vocabulary--the-two-layer-model)
+2. [Tables & schema](#2-tables--schema) — [ER diagrams](#21-entity-relationships) · [conventions](#22-conventions) · [taxonomy](#23-taxonomy--lookup-tables) · [brands/branches](#24-brand--branch-tables) · [menu](#25-menu-tables) · [canonical dishes](#26-canonical_dishes--the-compare-layer) · [users & reviews](#27-users) · [views](#29-views) · [indexes](#210-indexes--extensions) · [changing the schema](#211-changing-the-schema)
 
-The database is a **derived artifact**: everything except users and reviews can be rebuilt from the pipeline's JSON outputs. That single fact explains most of the design below.
+**Part II — The algorithms**
+
+3. [Algorithms & methods](#3-algorithms--methods) — [food types & sub types](#31-food-types--sub-types-classification) · [brands & restaurants](#32-brands--restaurants-chain-identity) · [canonical dishes](#33-canonical-dishes-the-compare-identity) · [comparing dishes](#34-comparing-dishes-brand-cards-search-compare) · [ratings](#35-ratings-pooling--the-display-rule) · [end-to-end trace](#36-end-to-end-a-real-dish-through-the-whole-system)
+
+**Part III — Reference**
+
+4. [Design principles](#4-design-principles) · 5. [Python layer](#5-the-python-layer) · 6. [Pipeline mechanics](#6-pipeline-mechanics-load_batchpy) · 7. [API reference](#7-api-reference) · 8. [Auth](#8-auth) · 9. [Services & env](#9-external-services--environment-variables) · 10. [Testing](#10-testing) · 11. [Gaps](#11-known-gaps--deferred-work)
 
 ---
 
-## 2. Core concepts & vocabulary
+# Part I — The data
 
-Five nouns cover the whole data model. Get these straight and everything else reads cleanly.
+## 1. Vocabulary & the two-layer model
 
-| Term | DB table | What it is |
+Five nouns cover the entire data model.
+
+| Term | Table | What it is |
 |---|---|---|
-| **Brand** | `restaurant_chains` | The identity a diner recognizes: *Domino's Pizza*, *Bella Italia*. **In the API, "restaurant" means brand.** |
-| **Branch** (location) | `restaurants` | One physical outlet: *Domino's Dhanmondi*. Has coords, address, its own foodpanda rating. |
-| **Product** | `products` | One menu item **at one branch**: *Margherita at Domino's Dhanmondi*. |
+| **Brand** | `restaurant_chains` | The identity a diner recognizes: *Domino's Pizza*. **In the API, "restaurant" means brand.** |
+| **Branch** (location) | `restaurants` | One physical outlet: *Domino's Pizza - Dhanmondi*. Has coords, address, its own foodpanda rating. |
+| **Product** | `products` | One menu item **at one branch**: *Margherita at Domino's Dhanmondi, 348tk*. |
 | **Variation** | `product_variations` | A size/option price point on one product: *Margherita — Large — 649tk*. |
-| **Canonical dish** | `canonical_dishes` | A cross-brand comparison identity: *"Chicken Biryani" as served by 9 different brands*. |
+| **Canonical dish** | `canonical_dishes` | A cross-**brand** comparison identity: *"French Fries" as sold by 61 different brands*. |
 
-And one derived (not stored) concept:
+Plus one thing that is **derived, never stored**:
 
 | Term | Built by | What it is |
 |---|---|---|
-| **Brand dish card** | `brand_dishes.py`, at read time | A brand's branches collapsed into one menu entry: *Margherita at Domino's, 199–348tk, at 3 of 3 branches*. There is deliberately **no table** for this — see §3.3. |
+| **Brand dish card** | `brand_dishes.py`, at read time | A brand's branches collapsed into one menu entry: *Margherita at Domino's, 199–348tk, at 3 of 3 branches*. There is deliberately **no table** for this ([§4.3](#43-aggregate-at-read-time-store-no-derived-state)). |
 
-### 2.1 The two-layer model
+### 1.1 Two grouping layers that stack
 
-Two grouping layers that look similar but do different jobs. They **stack**:
+The single most confusing thing in this codebase is that there are **two** dedupe/grouping layers doing **different jobs**:
 
 | Layer | Job | Scope | Example |
 |---|---|---|---|
 | **Chain grouping** (brand cards) | Dedupe *within* one brand | intra-brand | Domino's Margherita at 3 branches → **1 card** |
-| **Canonical dish** | Compare *across* brands | inter-brand | Chicken Biryani at **9 different brands** |
+| **Canonical dish** | Compare *across* brands | inter-brand | French Fries at **61 different brands** |
 
-They were originally conflated: canonical promotion counted *branches*, so a chain-exclusive item sold at 3 branches of one chain looked "comparable across restaurants" when nobody else makes it. Fixing promotion to count **brands** dropped canonical dishes 2,527 → 1,431. Those 1,096 dishes weren't lost — they're the chain layer's job and are still fully searchable; they just stopped pretending to be comparisons.
+They were originally conflated: canonical promotion counted *branches*, so a chain-exclusive item sold at 3 branches of one chain looked "comparable across restaurants" when nobody else makes it. Fixing promotion to count **brands** dropped canonical dishes 2,527 → 1,431. Those 1,096 weren't lost — they were the chain layer's job misfiled into the canonical layer, and they're still fully searchable. They just stopped pretending to be comparisons.
 
-### 2.2 The load-bearing invariant: every restaurant is a brand
+### 1.2 The load-bearing invariant: every restaurant is a brand
 
-Every `restaurants` row has a `chain_id` — no exceptions. A standalone restaurant is *a brand of one* (`branch_count == 1`). Live numbers: **451 branches → 378 brands** (53 multi-location, 325 solo).
+Every `restaurants` row has a `chain_id`. No exceptions. A standalone restaurant is *a brand of one* (`branch_count == 1`). Live: **451 branches → 378 brands** (53 multi-location, 325 solo).
 
-Why this matters: every query in the codebase is a plain `GROUP BY chain_id`. There is **zero** `if chain else standalone` branching anywhere — a standalone restaurant's brand card, brand page, and menu are shape-identical to a chain's. When you add a feature, keep it that way.
-
----
-
-## 3. Design principles
-
-These five principles explain nearly every structural choice. When you're unsure how to build something new, check it against these.
-
-### 3.1 SQL-first: `schema.sql` is the source of truth, not the ORM
-
-The schema uses Postgres-native features the ORM can't express: trigram (`pg_trgm`) GIN indexes for fuzzy search, `TEXT[]` alias arrays with GIN indexes, partial indexes, a generated `GEOGRAPHY` column in the geo add-on. So:
-
-- `schema.sql` **creates** the database. `models.py` is a thin read/write *mapping* over tables that already exist.
-- `main.py` must **never** call `create_all()` or run ad-hoc migrations. (It used to; that was removed deliberately.)
-- Schema changes go in **both** `schema.sql` (fresh DBs) **and** a numbered file in `migrations/` (existing DBs). See §4.10.
-
-### 3.2 The pipeline owns catalogue data; the DB is derived
-
-Curated data (taxonomy rules, spelling maps, brand overrides) lives in **pipeline code**, never as hand-edited DB rows. The DB gets reloaded from pipeline output; anything typed directly into the database is overwritten or orphaned on the next load. If you want to fix a wrong classification, fix it in `classify_batch.py`'s rules and re-run — don't `UPDATE` the row.
-
-The exceptions — data the pipeline must never clobber — are `users`, both review stacks, and user-contributed branches (created via `POST /branches/`, recognizable by `source_restaurant_code` starting with `user-`).
-
-### 3.3 Aggregate at read time; store no derived state
-
-Brand cards, pooled ratings, price ranges, availability badges, food-type stats — all computed per request from base rows. Nothing is denormalized. This is why:
-
-- There is **no `chain_dishes` table**. The card is a grouping over `products` rows, which must exist anyway (per-branch reviews, availability, future map pins).
-- `products.rating`/`review_count` and `restaurants.rating`/`review_count` columns exist but are **reserved and NOT maintained**. Don't read them; compute from approved reviews instead. They're there so that *if* review volume ever makes live aggregation too slow, denormalization is a migration away, not a redesign.
-
-The payoff: correctness by construction. There is no cache to invalidate, no stale aggregate, no "rebuild the rollup" job. At 16k products and pre-launch traffic this is comfortably fast; revisit only with evidence.
-
-### 3.4 Natural keys in URLs; serial ids never leave POST bodies
-
-Pipeline reloads churn serial ids (canonical dishes are fully rebuilt each load; products/restaurants keep ids only because they upsert). Two serial sequences (`restaurants.id`, `restaurant_chains.id`) also **overlap numerically** — a numeric `/restaurants/296` once silently served the *wrong restaurant* with no 404. So:
-
-| Key | Used for |
-|---|---|
-| `chain_code` (brand **slug**, e.g. `bella-italia`) | every `/restaurants/*` URL |
-| `(food_type_id, dish_slug)` | brand-dish URLs |
-| `source_product_id`, `source_restaurant_code` | pipeline upsert identity |
-| serial `id`s | POST bodies (`branch_id`, `dish_id`) and internal FKs only |
-
-### 3.5 Soft delete for products; union-with-badge for availability
-
-- A re-scrape that no longer sees a product sets `is_active = FALSE`, **never** `DELETE` — `product_reviews` cascades on delete, so a hard delete would silently destroy user reviews of a dish that's merely off the menu this week.
-- A brand's menu is the **union** of its branches' menus, badged "at 2 of 3 branches". Intersection would silently hide ~⅓ of a chain's menu; union without the badge would send someone across town for a dish their branch doesn't serve.
+Why it matters: every query is a plain `GROUP BY chain_id` with **zero** `if chain else standalone` branching. A solo restaurant's card, page, and menu are shape-identical to a chain's. When you add a feature, keep it that way.
 
 ---
 
-## 4. The database
+## 2. Tables & schema
 
-**20 tables + 3 views.** PostgreSQL 18 on Railway. Extension: `pg_trgm`. PostGIS is **not** available on Railway — geo lives in an optional add-on (§4.10).
+**20 tables + 3 views.** PostgreSQL 18 on Railway. Extension: `pg_trgm`. PostGIS is **not** available on Railway — geo is an optional add-on ([§2.11](#211-changing-the-schema)).
 
-### 4.0 Live row counts (verified 2026-07-17 against Railway)
+### 2.0 Live row counts (verified 2026-07-17)
 
-| Table | Rows | Table | Rows |
-|---|---:|---|---:|
-| `restaurants` | 451 | `cuisines` | 11 |
-| `restaurant_chains` | 378 | `food_categories` | 6 |
-| `products` | 16,402 (16,385 active) | `flavor_tags` | 9 |
-| `product_variations` | 20,643 | `product_flavor_tags` | 14,857 |
-| `canonical_dishes` | 1,431 | `restaurant_cuisines` | 409 |
-| `food_types` | 28 | `restaurant_sources` | 0 *(defined, unused)* |
-| `food_sub_types` | 111 | `users` + all 6 review tables | 0 *(pre-launch)* |
+| Table | Rows | | Table | Rows |
+|---|---:|---|---|---:|
+| `restaurants` | 451 | | `cuisines` | 11 |
+| `restaurant_chains` | 378 | | `food_categories` | 6 |
+| `products` | 16,402 *(16,385 active)* | | `flavor_tags` | 9 |
+| `product_variations` | 20,643 | | `product_flavor_tags` | 14,857 |
+| `canonical_dishes` | 1,431 | | `restaurant_cuisines` | 409 |
+| `food_types` | 28 | | `restaurant_sources` | 0 *(defined, unused)* |
+| `food_sub_types` | 111 | | `users` + all 6 review tables | 0 *(pre-launch)* |
 
-Derived at read time: **13,653 brand-dish cards** from 16,385 active products — ~17% of the raw catalogue was chain duplication, now collapsed per request.
+Derived at read time: **13,653 brand-dish cards** from 16,385 active products — ~17% of the catalogue was chain duplication, collapsed per request.
 
-### 4.1 Conventions (read once, apply everywhere)
+### 2.1 Entity relationships
 
-- **`id`** — `SERIAL` (or `SMALLSERIAL` for small lookups) primary key. Internal only; churns on reload for rebuilt tables (§3.4).
-- **Natural keys** — `UNIQUE` columns from the source data (`source_product_id`, `source_restaurant_code`, `chain_code`). These are the upsert identity and are stable across reloads.
-- **`created_at` / `updated_at`** — `TIMESTAMPTZ DEFAULT NOW()`; `updated_at` is maintained by the ORM (`onupdate`), not a DB trigger — raw-SQL writes won't touch it.
-- **`status`** on reviews — `pending | approved | rejected` (CHECK constraint). All public reads filter `approved`; post-moderation inserts `approved` directly (§4.7).
-- **Lookup FKs** — `ON DELETE SET NULL` for classification (losing a food type shouldn't delete products); `ON DELETE CASCADE` for ownership (deleting a product deletes its variations and reviews).
-- **Money** — `NUMERIC(10,2)`, BDT, column names end `_bdt`.
+Split into two diagrams for readability. **Catalogue** first — this is the part you'll work in:
 
-### 4.2 Taxonomy & lookup tables
+```mermaid
+erDiagram
+    restaurant_chains ||--o{ restaurants : "1 brand has N branches"
+    restaurants ||--o{ products : "1 branch has N menu items"
+    products ||--o{ product_variations : "N size/price points"
+    canonical_dishes |o--o{ products : "compare identity (nullable)"
 
-The browsing taxonomy has **four independent dimensions**. Every product carries a nullable single FK to each — deliberately single-valued, not many-to-many, so classification is one decision per dimension per product:
+    restaurants ||--o{ restaurant_cuisines : "M-N"
+    cuisines ||--o{ restaurant_cuisines : "M-N"
+    restaurants ||--o{ restaurant_sources : "provenance (unused)"
+    products ||--o{ product_flavor_tags : "M-N"
+    flavor_tags ||--o{ product_flavor_tags : "M-N"
+
+    food_types ||--o{ food_sub_types : "scoped per type"
+    food_types |o--o{ products : "classifies"
+    food_sub_types |o--o{ products : "classifies"
+    food_categories |o--o{ products : "classifies"
+    cuisines |o--o{ products : "classifies"
+    food_types |o--o{ canonical_dishes : "majority vote"
+    food_sub_types |o--o{ canonical_dishes : "majority vote"
+    food_categories |o--o{ canonical_dishes : "majority vote"
+    cuisines |o--o{ canonical_dishes : "majority vote"
+
+    restaurant_chains {
+        int id PK "POST bodies only"
+        text chain_code UK "THE url slug"
+        text name "from branch names"
+    }
+    restaurants {
+        int id PK "branch_id"
+        text source_restaurant_code UK "upsert key"
+        int chain_id FK "ALWAYS populated"
+        text name
+        text area
+        numeric latitude
+        numeric longitude
+        numeric old_rating "foodpanda"
+        bool is_active
+    }
+    products {
+        int id PK "dish_id"
+        bigint source_product_id UK "upsert key"
+        int restaurant_id FK
+        text name
+        text normalized_name "brand-card key"
+        numeric base_price_bdt
+        int food_type_id FK "brand-card key"
+        int canonical_dish_id FK "nullable"
+        bool is_active "soft delete"
+    }
+    product_variations {
+        int id PK
+        int product_id FK
+        text label "default 'Regular'"
+        numeric price_bdt
+    }
+    canonical_dishes {
+        int id PK "REBUILT every load"
+        text name "most common spelling"
+        text_array aliases "other spellings"
+        int food_type_id FK "part of group key"
+    }
+```
+
+**Users & reviews** — two parallel stacks with identical shape:
+
+```mermaid
+erDiagram
+    users ||--o{ restaurant_reviews : "1 per user"
+    users ||--o{ product_reviews : "1 per user"
+    restaurants ||--o{ restaurant_reviews : "attached to a BRANCH"
+    products ||--o{ product_reviews : "attached to a PRODUCT"
+
+    restaurant_reviews ||--o{ restaurant_review_photos : "photos"
+    restaurant_reviews ||--o{ restaurant_review_votes : "votes"
+    product_reviews ||--o{ product_review_photos : "photos"
+    product_reviews ||--o{ product_review_votes : "votes"
+    users ||--o{ restaurant_review_votes : "casts"
+    users ||--o{ product_review_votes : "casts"
+
+    users {
+        int id PK
+        text email UK "email OR phone required"
+        text phone UK
+        text password_hash "bcrypt"
+        text display_name "aliased 'username'"
+    }
+    restaurant_reviews {
+        int id PK
+        int user_id FK
+        int restaurant_id FK "the BRANCH"
+        smallint rating "1-5"
+        text body "API: 'comment'"
+        text status "pending|approved|rejected"
+    }
+    product_reviews {
+        int id PK
+        int user_id FK
+        int product_id FK "ONE branch's dish"
+        smallint rating "1-5"
+        text body
+        text status "reads filter approved"
+    }
+```
+
+The relationship that surprises people: **reviews attach to branches/products, never to brands.** Brand-level ratings are pooled at read time ([§3.5](#35-ratings-pooling--the-display-rule)).
+
+### 2.2 Conventions
+
+Read once, applies everywhere:
+
+- **`id`** — `SERIAL` (`SMALLSERIAL` for small lookups) PK. Internal only; churns on reload for rebuilt tables.
+- **Natural keys** — `UNIQUE` columns from the source (`source_product_id`, `source_restaurant_code`, `chain_code`). These are the upsert identity and are **stable across reloads** — use them for anything durable.
+- **`created_at` / `updated_at`** — `TIMESTAMPTZ DEFAULT NOW()`. `updated_at` is maintained by the ORM (`onupdate`), **not** a DB trigger — raw-SQL writes won't touch it.
+- **`status`** on reviews — `pending | approved | rejected` (CHECK). All public reads filter `approved`.
+- **FK policy** — `ON DELETE SET NULL` for classification (losing a food type shouldn't delete products); `ON DELETE CASCADE` for ownership (deleting a product deletes its variations and reviews).
+- **Money** — `NUMERIC(10,2)`, BDT, columns end `_bdt`.
+
+### 2.3 Taxonomy & lookup tables
+
+Four **independent dimensions**, each a nullable single FK on `products` — deliberately single-valued, so classification is one decision per dimension per product. The algorithm that assigns them is [§3.1](#31-food-types--sub-types-classification).
 
 1. **Category** (`food_categories`, 6) — meal role: Breakfast / Main Dish / Appetizer / Sides / Dessert / Drinks.
-2. **Food Type** (`food_types`, 28) — deliberately **coarse** browsing umbrellas: Rice, Curry, Pizza, Burger, Beverages, Set Menu… Coarse is a feature: 28 tiles fit on a browse screen; 300 wouldn't.
-3. **Food Sub Type** (`food_sub_types`, 111) — the *natural differentiator within each type*, which differs per type: protein for Curry, format for Rice (Biryani / Fried Rice / Tehari), preparation for Dumpling (Fried / Steamed), drink kind for Beverages.
-4. **Cuisine** (`cuisines`, 11) — Bangladeshi / Indian / Chinese / Italian…; "Asian" is a catch-all only.
+2. **Food Type** (`food_types`, 28) — deliberately **coarse** browsing umbrellas: Rice, Curry, Pizza, Burger, Beverages, Set Menu… Coarse is a feature: 28 tiles fit a browse screen; 300 wouldn't.
+3. **Food Sub Type** (`food_sub_types`, 111) — the *natural differentiator within each type*, which **differs per type**: protein for Curry, format for Rice (Biryani/Kacchi, Fried Rice, Tehari), preparation for Momo/Dumpling (Fried, Soup), drink kind for Beverages.
+4. **Cuisine** (`cuisines`, 11) — Bangladeshi / Indian / Chinese / Italian…; "Asian" is a catch-all **only** for genuinely pan-Asian formats, not a dumping ground.
 
-The classifier's key rule (**"format wins over garnish"**): *Tandoori Chicken Pizza* → Pizza, not Grill; *Chicken Seekh Kabab Roll* → Wraps & Rolls, not Kebab. Implemented by **rule order** (first match wins) in `classify_batch.py`'s `FOOD_TYPE_RULES`. **Set Menu** is its own food type; its `sub_type` is the primary component.
-
-#### `cuisines`
+#### `cuisines` · `food_categories`
 | Column | Type | Notes |
 |---|---|---|
 | `id` | SMALLSERIAL PK | |
-| `name` | TEXT NOT NULL UNIQUE | e.g. `Bangladeshi`. Rows created on demand by `load_batch` from pipeline output. |
-
-#### `food_categories`
-| Column | Type | Notes |
-|---|---|---|
-| `id` | SMALLSERIAL PK | |
-| `name` | TEXT NOT NULL UNIQUE | Meal role (6 values). Created on demand by `load_batch`. |
+| `name` | TEXT NOT NULL UNIQUE | Rows created on demand by `load_batch` from pipeline output. |
 
 #### `food_types`
 | Column | Type | Notes |
 |---|---|---|
-| `id` | SMALLSERIAL PK | Part of the brand-card grouping key and brand-dish URLs. |
+| `id` | SMALLSERIAL PK | Part of the brand-card grouping key **and** brand-dish URLs. |
 | `name` | TEXT NOT NULL UNIQUE | e.g. `Pizza`, `Set Menu`. |
 
-Deliberately a **bare** `(id, name)` lookup. The v1 schema had image/description/parent columns; they were dropped when the "rich browsable entity" role moved to `canonical_dishes`. The API still *accepts* description/image on food-type create/update for backward compatibility but does not persist them, and the photo endpoint returns **501** (see §8, food-types).
+Deliberately a **bare** `(id, name)` lookup. v1 had image/description/parent columns; dropped when the "rich browsable entity" role moved to `canonical_dishes`. The API still *accepts* description/image on create/update (backward compat) but doesn't persist them, and the photo endpoint returns **501**.
 
 #### `food_sub_types`
 | Column | Type | Notes |
 |---|---|---|
 | `id` | SMALLSERIAL PK | |
-| `food_type_id` | SMALLINT NOT NULL FK → food_types, CASCADE | Sub-types are **scoped under** a type; the same name can exist under two types. |
+| `food_type_id` | SMALLINT NOT NULL FK → food_types, CASCADE | Sub-types are **scoped under** a type — the same name can exist under two types. |
 | `name` | TEXT NOT NULL | `UNIQUE (food_type_id, name)`. |
 
 #### `flavor_tags`
@@ -207,20 +239,20 @@ Deliberately a **bare** `(id, name)` lookup. The v1 schema had image/description
 |---|---|---|
 | `id` | SMALLSERIAL PK | |
 | `slug` | TEXT NOT NULL UNIQUE | e.g. `cheesy`, `smoky_bbq` — from the classifier. |
-| `label` | TEXT NOT NULL | Display text; `load_batch` derives it from the slug (`smoky_bbq` → `Smoky Bbq`). |
+| `label` | TEXT NOT NULL | Display text; `load_batch` derives it (`smoky_bbq` → `Smoky Bbq`). |
 
-9 tags exist with 14,857 product links — populated by the classifier via `load_batch`. (An older note claiming flavor tags were unpopulated is stale.) The API's `FlavorTagOut` exposes `label` under the field name `name`.
+9 tags, 14,857 product links. The API's `FlavorTagOut` exposes `label` under the field name `name` (the slug isn't exposed).
 
-### 4.3 Brand & branch tables
+### 2.4 Brand & branch tables
 
 #### `restaurant_chains` — the BRAND
 | Column | Type | Notes |
 |---|---|---|
-| `id` | SERIAL PK | `chain_id` in code. POST bodies only — never in URLs. |
-| `chain_code` | TEXT NOT NULL UNIQUE | **The brand slug and API URL key** (`bella-italia`). Written by `bootstrap_chains.py` → `load_batch`. All 378 match `^[a-z0-9-]+$` and survive reloads. User-created brands get `user-<slug>-<8 hex>`. *(Named for the foodpanda-era "chain code" it once held; it has meant "brand slug" since the brand model landed.)* |
-| `name` | TEXT NOT NULL | Display name, derived from **branch names** with location stripped (case-preservingly): `KOI Thé`, `Domino's Pizza`. The scraped `chain_name` is deliberately unused — it was contaminated (named branches that don't exist in the data). |
+| `id` | SERIAL PK | `chain_id` in code. **POST bodies only — never in URLs.** |
+| `chain_code` | TEXT NOT NULL UNIQUE | **The brand slug and API URL key** (`domino-s-pizza`). Written by `bootstrap_chains.py` → `load_batch`. All 378 match `^[a-z0-9-]+$`. User-created brands get `user-<slug>-<8 hex>`. *(Named for the foodpanda "chain code" it once held; it has meant "brand slug" since the brand model landed.)* |
+| `name` | TEXT NOT NULL | Display name, derived from **branch names** with location stripped case-preservingly ([§3.2](#32-brands--restaurants-chain-identity)). The scraped `chain_name` is deliberately unused — it's contaminated. |
 
-Orphan rows (no restaurant points at them) are deleted at the end of every load (`delete_orphan_chains`), because brands are re-derived each load.
+Orphan rows (nothing points at them) are deleted at the end of every load — brands are re-derived each load.
 
 #### `restaurants` — the BRANCH (location)
 | Column | Type | Notes |
@@ -229,59 +261,47 @@ Orphan rows (no restaurant points at them) are deleted at the end of every load 
 | `source_restaurant_code` | TEXT NOT NULL UNIQUE | Natural key from the scrape (e.g. `acks`); upsert identity. `user-…` prefix = user-contributed. |
 | `name` | TEXT NOT NULL | Branch name as scraped, often with area suffix (`Waffle Up - Dhanmondi`). |
 | `address` | TEXT NULL | |
-| `latitude` / `longitude` | NUMERIC(10,8) / NUMERIC(11,8) | Populated for all 451. Kept raw for display/export; the derived `geog` column lives in the geo add-on only (§4.10). |
-| `rating` / `review_count` | NUMERIC(2,1) / INTEGER | **Reserved, not maintained** (§3.3). Khawon's own rating is computed live from `restaurant_reviews`. |
-| `old_rating` / `old_review_count` | NUMERIC(2,1) / INTEGER | The **foodpanda scraped** rating — the cold-start fallback in `display_rating` (§7.5). |
-| `budget_tier` | SMALLINT CHECK 1–3 | 1 = cheap, 3 = expensive, from the source. |
+| `latitude` / `longitude` | NUMERIC(10,8) / (11,8) | Populated for all 451. Raw for display/export; the derived `geog` column lives in the geo add-on only. |
+| `rating` / `review_count` | NUMERIC(2,1) / INTEGER | ⚠️ **Reserved, NOT maintained** ([§4.3](#43-aggregate-at-read-time-store-no-derived-state)). Don't read them. |
+| `old_rating` / `old_review_count` | NUMERIC(2,1) / INTEGER | The **foodpanda scraped** rating — the cold-start fallback in `display_rating` ([§3.5](#35-ratings-pooling--the-display-rule)). |
+| `budget_tier` | SMALLINT CHECK 1–3 | 1 = cheap, 3 = expensive. From the source. |
 | `phone` | TEXT NULL | |
 | `city` | TEXT NOT NULL DEFAULT 'Dhaka' | |
-| `area` | TEXT NULL | Dhanmondi / Gulshan / Uttara — derived from the scrape batch filename, not geocoding. |
-| `chain_id` | INTEGER FK → restaurant_chains, SET NULL | Nullable in the DDL but **always populated** in practice — the every-restaurant-is-a-brand invariant (§2.2). |
-| `hero_image_url` / `logo_image_url` | TEXT NULL | From the scrape; hero is also settable via the branch admin endpoints (Cloudinary). |
-| `google_place_id` | TEXT NULL | Currently **NULL for all 451** — the `match_google_places.py` output was never merged; deferred to the map feature. |
+| `area` | TEXT NULL | Dhanmondi / Gulshan / Uttara — derived from the **scrape batch filename**, not geocoding. |
+| `chain_id` | INTEGER FK → restaurant_chains, SET NULL | Nullable in DDL but **always populated** in practice ([§1.2](#12-the-load-bearing-invariant-every-restaurant-is-a-brand)). |
+| `hero_image_url` / `logo_image_url` | TEXT NULL | From the scrape; hero also settable via branch admin (Cloudinary). |
+| `google_place_id` | TEXT NULL | **NULL for all 451** — `match_google_places.py` output was never merged. Deferred to the map feature. |
 | `match_status` | TEXT CHECK | `unmatched \| auto_matched \| needs_review \| manually_matched \| rejected` — Google-Places matching state, **not** review moderation. |
-| `is_active` | BOOLEAN DEFAULT TRUE | All queries filter on it. |
+| `is_active` | BOOLEAN DEFAULT TRUE | Every query filters on it. |
 | `created_at` / `updated_at` | TIMESTAMPTZ | |
 
 #### `restaurant_cuisines` — M:N branch ↔ cuisine
-| Column | Type | Notes |
-|---|---|---|
-| `restaurant_id` | INTEGER FK CASCADE, PK part | |
-| `cuisine_id` | SMALLINT FK CASCADE, PK part | Rebuilt (delete + insert) for the batch's restaurants on every load. |
+`restaurant_id` FK CASCADE + `cuisine_id` FK CASCADE, composite PK. Rebuilt (delete + insert) for the batch's restaurants on every load. Cuisine attaches at **branch** level (that's how the source provides it) *and* at product level as a single FK; brand-level cuisine lists are unioned at read time.
 
-Cuisine is attached at **branch** level (that's how the source provides it) and additionally at product level as a single FK. Brand-level cuisine lists are unioned at read time.
+#### `restaurant_sources` — scrape provenance *(defined, 0 rows)*
+`id` PK · `restaurant_id` FK CASCADE · `source_name` (e.g. `foodpanda`; `UNIQUE (restaurant_id, source_name)`) · `source_url` · `last_scraped_at` · `raw_metadata` JSONB *(escape hatch for extra source fields without schema churn)*.
 
-#### `restaurant_sources` — scrape provenance *(defined, currently unused — 0 rows)*
-| Column | Type | Notes |
-|---|---|---|
-| `id` | SERIAL PK | |
-| `restaurant_id` | INTEGER NOT NULL FK CASCADE | |
-| `source_name` | TEXT NOT NULL | e.g. `foodpanda`. `UNIQUE (restaurant_id, source_name)`. |
-| `source_url` | TEXT NULL | |
-| `last_scraped_at` | TIMESTAMPTZ NULL | |
-| `raw_metadata` | JSONB NULL | Escape hatch to preserve extra source fields without schema churn. |
+Designed for multi-source provenance; `load_batch` doesn't populate it. Harmless empty; use it when a second source appears.
 
-Designed for multi-source provenance; `load_batch` doesn't populate it yet. Harmless to leave empty; use it when a second data source appears.
-
-### 4.4 Menu tables
+### 2.5 Menu tables
 
 #### `products` — one menu item at ONE branch
 | Column | Type | Notes |
 |---|---|---|
-| `id` | SERIAL PK | The `dish_id` in dish URLs/POST bodies. Stable *in practice* (upsert), but never persist it externally. |
+| `id` | SERIAL PK | The `dish_id` in dish URLs/POST bodies. |
 | `source_product_id` | BIGINT NOT NULL UNIQUE | Natural key from the scrape; upsert identity. Verified globally unique in real data. |
 | `restaurant_id` | INTEGER NOT NULL FK → restaurants, CASCADE | The branch. |
-| `name` | TEXT NOT NULL | Raw menu spelling, as scraped (post-consolidation). |
-| `description` | TEXT NULL | 100% populated in current data. |
+| `name` | TEXT NOT NULL | Raw menu spelling, post-consolidation. |
+| `description` | TEXT NULL | 100% populated currently. |
 | `base_price_bdt` | NUMERIC(10,2) NOT NULL CHECK ≥ 0 | The "from" price = cheapest variation. |
-| `image_url` | TEXT NULL | ~90% populated. Some foodpanda URLs carry a `?width=%s` template — normalized at read time (`normalize_product_image_url`). |
-| `is_sold_out` | BOOLEAN DEFAULT FALSE | Source's sold-out flag (point-in-time from scrape). |
-| `category_id` / `cuisine_id` / `food_type_id` / `food_sub_type_id` | SMALLINT FK SET NULL | The four taxonomy dimensions (§4.2). `food_type_id` is 100% populated; part of the brand-card key. |
-| `canonical_dish_id` | INTEGER FK → canonical_dishes, SET NULL | NULL = not comparable across brands (single-brand dish) — still fully searchable. |
-| `normalized_name` | TEXT NULL (indexed) | **The brand-card grouping key**, written by `load_batch` using `canonical_match_key()` — the *same* function the canonical bootstrap groups with, so both layers agree on what "the same dish name" means. |
-| `is_active` | BOOLEAN DEFAULT TRUE | **Soft delete** (§3.5). Set FALSE when a re-scrape no longer sees the item. |
-| `last_seen_at` | TIMESTAMPTZ | Touched on every load that sees the product. |
-| `rating` / `review_count` | | **Reserved, not maintained** (§3.3). |
+| `image_url` | TEXT NULL | ~90% populated. Some foodpanda URLs carry a `?width=%s` template — patched at read time. |
+| `is_sold_out` | BOOLEAN DEFAULT FALSE | Point-in-time from the scrape. |
+| `category_id` / `cuisine_id` / `food_type_id` / `food_sub_type_id` | SMALLINT FK SET NULL | The four dimensions ([§2.3](#23-taxonomy--lookup-tables)). `food_type_id` is 100% populated and part of the brand-card key. |
+| `canonical_dish_id` | INTEGER FK → canonical_dishes, SET NULL | NULL = not comparable across brands — still fully searchable. |
+| `normalized_name` | TEXT NULL *(indexed)* | **The brand-card grouping key** ([§3.4](#34-comparing-dishes-brand-cards-search-compare)), written by `load_batch` via `canonical_match_key()`. |
+| `is_active` | BOOLEAN DEFAULT TRUE | **Soft delete** ([§4.5](#45-soft-delete-for-products-union-with-badge-for-availability)). |
+| `last_seen_at` | TIMESTAMPTZ | Touched by every load that sees the product. |
+| `rating` / `review_count` | | ⚠️ **Reserved, NOT maintained.** |
 | `created_at` / `updated_at` | TIMESTAMPTZ | |
 
 #### `product_variations` — size/option price points
@@ -289,329 +309,684 @@ Designed for multi-source provenance; `load_batch` doesn't populate it yet. Harm
 |---|---|---|
 | `id` | SERIAL PK | |
 | `product_id` | INTEGER NOT NULL FK CASCADE | |
-| `label` | TEXT NOT NULL DEFAULT 'Regular' | `UNIQUE (product_id, label)`. Defaults to `'Regular'` instead of NULL **on purpose**: Postgres treats NULLs as distinct under UNIQUE, so `UNIQUE(product_id, NULL)` wouldn't actually block duplicate default rows. |
+| `label` | TEXT NOT NULL DEFAULT 'Regular' | `UNIQUE (product_id, label)`. Defaults to `'Regular'` rather than NULL **on purpose**: Postgres treats NULLs as distinct under UNIQUE, so `UNIQUE(product_id, NULL)` would *not* block duplicate default rows. |
 | `price_bdt` | NUMERIC(10,2) NOT NULL CHECK ≥ 0 | |
 | `sort_order` | SMALLINT DEFAULT 0 | Source order. |
 
-Rebuilt (delete + insert) for the batch's products on every load — variations have no natural key of their own.
+Rebuilt (delete + insert) each load — variations have no natural key of their own.
 
 #### `product_flavor_tags` — M:N product ↔ flavor tag
-Composite PK `(product_id, flavor_tag_id)`, both CASCADE. Rebuilt each load, same as variations.
+Composite PK `(product_id, flavor_tag_id)`, both CASCADE. Rebuilt each load.
 
-### 4.5 The compare layer: `canonical_dishes`
+### 2.6 `canonical_dishes` — the compare layer
 
-The cross-brand comparison identity (§2.1). **Fully rebuilt on every load**: links nulled, table wiped, reinserted from `canonical_dishes.json` — which is why canonical serial ids must never be persisted anywhere.
+The cross-brand comparison identity. **Fully rebuilt every load** (links nulled → table wiped → reinserted), which is why canonical ids must never be persisted anywhere. Algorithm: [§3.3](#33-canonical-dishes-the-compare-identity).
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | SERIAL PK | Used in `/dishes/compare/{id}` URLs — safe only because search hands the id to compare in the same session; never store it. |
-| `name` | TEXT NOT NULL | Display name = most common raw spelling among member products. |
-| `aliases` | TEXT[] NOT NULL DEFAULT '{}' | Other observed spellings; GIN-indexed, searched by `/dishes/search`. Also the future home for LLM/pgvector spelling unification — fillable without schema change. |
-| `food_type_id` | SMALLINT FK SET NULL | Part of the grouping key `(food_type, normalized name)`. **Sub-type is deliberately NOT in the key** — the per-product classifier disagrees on sub_type across restaurants for the same dish (Beef Tehari: "Tehari" at one place, "Biryani" at another) and would fragment groups. |
-| `food_sub_type_id` / `cuisine_id` / `category_id` | SMALLINT FK SET NULL | **Majority vote** across member products — gives one stable value so a dish doesn't flicker in and out of a filter when classifiers disagree per-restaurant. Products keep their own raw values. |
-| `image_url` | TEXT NULL | Fallback only; search actually serves a random image from the member products' pool (§7.6). |
+| `id` | SERIAL PK | Used in `/dishes/compare/{id}` — safe only because search hands the id to compare within one session. Never store it. |
+| `name` | TEXT NOT NULL | Display name = most common raw spelling among members. |
+| `aliases` | TEXT[] NOT NULL DEFAULT '{}' | Other observed spellings; GIN-indexed and searched. Also the landing zone for future LLM/pgvector spelling unification — fillable with no schema change. |
+| `food_type_id` | SMALLINT FK SET NULL | Part of the group key. **Sub-type is deliberately NOT in the key** — the classifier disagrees on sub_type across restaurants for the same dish (Beef Tehari: "Tehari" here, "Biryani" there) and would fragment groups. |
+| `food_sub_type_id` / `cuisine_id` / `category_id` | SMALLINT FK SET NULL | **Majority vote** across members — one stable value, so a dish doesn't flicker in/out of a filter when classifiers disagree per-restaurant. Products keep their own raw values. |
+| `image_url` | TEXT NULL | Fallback only; search serves a random image from the member pool. |
 | `created_at` | TIMESTAMPTZ | |
 
-Promotion rule: a name group becomes canonical only when it spans **≥ 2 distinct brands** (`MIN_BRANDS = 2`, counted via chains.json — not branches, §2.1). Set Menu items are excluded entirely. Single-brand dishes stay `canonical_dish_id = NULL` and remain searchable.
+### 2.7 `users`
 
-### 4.6 Users
-
-#### `users`
 | Column | Type | Notes |
 |---|---|---|
 | `id` | SERIAL PK | JWT `sub` claim. |
 | `email` | TEXT UNIQUE NULL | CHECK: email OR phone must be present. |
-| `phone` | TEXT UNIQUE NULL | Schema supports phone signup; the current API only implements email. |
-| `password_hash` | TEXT NOT NULL | bcrypt. The ORM exposes a read-only `hashed_password` alias for older code. |
-| `display_name` | TEXT NOT NULL | The ORM exposes a read-only `username` alias. Uniqueness is enforced **app-side only** (register checks) — no DB constraint; a race could theoretically duplicate it. |
-| `is_active` | BOOLEAN DEFAULT TRUE | Not yet checked at login (see §12). |
+| `phone` | TEXT UNIQUE NULL | Schema supports phone signup; API implements email only. |
+| `password_hash` | TEXT NOT NULL | bcrypt. ORM exposes a read-only `hashed_password` alias. |
+| `display_name` | TEXT NOT NULL | ORM exposes a read-only `username` alias. Uniqueness is **app-side only** — no DB constraint; a race could duplicate it. |
+| `is_active` | BOOLEAN DEFAULT TRUE | Not yet checked at login ([§11](#11-known-gaps--deferred-work)). |
 | `created_at` / `updated_at` | TIMESTAMPTZ | |
 
-### 4.7 The two review stacks (parallel by design)
+### 2.8 The two review stacks (parallel by design)
 
-Two deliberately separate stacks that answer different questions:
+Two separate stacks answering different questions:
 
 - **`restaurant_reviews`** — "how was the *experience* at this **location**?" Attached to a **branch**; displayed pooled per brand, tagged with the branch.
-- **`product_reviews`** — "how was this **dish** at this branch?" Attached to a **product** row (one branch's dish).
+- **`product_reviews`** — "how was this **dish** at this branch?" Attached to a **product** row.
 
-Each stack has identical satellite tables (`*_review_photos`, `*_review_votes`). Shared rules:
+Shared rules:
 
-- **Account required.** One review per user per target (`UNIQUE (user_id, restaurant_id)` / `UNIQUE (user_id, product_id)`) — resubmitting **updates** your review rather than stacking a second one.
-- **Post-moderation:** reviews insert with `status='approved'` and appear immediately; all public reads and rating math filter `status='approved'`. Switching to pre-moderation later = default to `'pending'` + build an approval queue. Nothing else changes.
-- Ratings are **computed live** from approved reviews at read time (§3.3).
+- **Account required.** One review per user per target (`UNIQUE (user_id, restaurant_id)` / `UNIQUE (user_id, product_id)`) — resubmitting **updates** rather than stacking.
+- **Post-moderation:** inserts write `status='approved'`, visible immediately; all reads and rating math filter `approved`. Switching to pre-moderation = default `'pending'` + build a queue. Nothing else changes.
+- Ratings **computed live** from approved reviews.
 
 #### `restaurant_reviews` / `product_reviews`
 | Column | Type | Notes |
 |---|---|---|
 | `id` | SERIAL PK | |
 | `user_id` | INTEGER NOT NULL FK users CASCADE | |
-| `restaurant_id` / `product_id` | INTEGER NOT NULL FK CASCADE | The target. **This cascade is why products soft-delete** (§3.5). |
+| `restaurant_id` / `product_id` | INTEGER NOT NULL FK CASCADE | The target. **This cascade is why products soft-delete.** |
 | `rating` | SMALLINT NOT NULL CHECK 1–5 | |
 | `body` | TEXT NULL | Exposed as `comment` in the API. |
-| `status` | TEXT CHECK `pending\|approved\|rejected` DEFAULT 'pending' | App currently writes `'approved'` (post-moderation). |
-| `is_verified_visit` / `is_verified_order` | BOOLEAN DEFAULT FALSE | Future verification badge; exposed as `is_verified`. |
-| `helpful_count` / `not_helpful_count` | INTEGER DEFAULT 0 | Denormalized vote tallies — **not yet maintained**; the votes tables are the source of truth when voting ships. |
+| `status` | TEXT CHECK, DEFAULT 'pending' | App writes `'approved'`. |
+| `is_verified_visit` / `is_verified_order` | BOOLEAN DEFAULT FALSE | Future badge; exposed as `is_verified`. |
+| `helpful_count` / `not_helpful_count` | INTEGER DEFAULT 0 | Denormalized tallies — **not yet maintained**; the votes tables are the truth when voting ships. |
 | `created_at` / `updated_at` | TIMESTAMPTZ | |
 
-#### `*_review_photos`
-`id` PK · `review_id` FK CASCADE · `image_url` NOT NULL · `sort_order` · `created_at`. Schema-ready; no upload endpoint yet.
+#### `*_review_photos` · `*_review_votes`
+Photos: `id` PK · `review_id` FK CASCADE · `image_url` NOT NULL · `sort_order` · `created_at`.
+Votes: composite PK `(review_id, user_id)` — one vote per user per review · `is_helpful` BOOLEAN NOT NULL · `created_at`.
+Both schema-ready; no endpoints yet.
 
-#### `*_review_votes`
-Composite PK `(review_id, user_id)` — one vote per user per review · `is_helpful` BOOLEAN NOT NULL · `created_at`. Schema-ready; no endpoint yet.
+### 2.9 Views
 
-### 4.8 Views (`v_restaurant_summary`, `v_product_detail`, `v_canonical_dish_comparison`)
+`v_restaurant_summary`, `v_product_detail`, `v_canonical_dish_comparison` — defined at the bottom of `schema.sql`, handy for ad-hoc `psql` inspection (`v_canonical_dish_comparison` is the raw shape of the compare feature). **The API does not use them**; it builds richer shapes in Python. ⚠️ The first two expose the *reserved* stored rating columns, so their `rating` fields read NULL/0 — trust the API's computed ratings, not the views'.
 
-Three convenience views defined at the bottom of `schema.sql` — handy for ad-hoc `psql` inspection (e.g. `v_canonical_dish_comparison` is the raw shape of the compare feature). **The API does not use them**; it builds richer shapes in Python (§7). Note that `v_restaurant_summary`/`v_product_detail` expose the *reserved* stored rating columns, so their `rating` fields read NULL/0 — trust the API's computed ratings, not the views'.
-
-### 4.9 Indexes & extensions — what each one serves
+### 2.10 Indexes & extensions
 
 | Index | Serves |
 |---|---|
-| `idx_products_name_trgm`, `idx_restaurants_name_trgm`, `idx_canonical_dishes_name_trgm` (GIN, `gin_trgm_ops`) | The `ILIKE '%q%'` searches in `/dishes/search` and `/restaurants?q=`. **pg_trgm is why substring search is fast**; a plain btree can't serve infix `LIKE`. |
+| `idx_products_name_trgm`, `idx_restaurants_name_trgm`, `idx_canonical_dishes_name_trgm` (GIN, `gin_trgm_ops`) | The `ILIKE '%q%'` searches. **pg_trgm is why substring search is fast** — a btree cannot serve infix `LIKE`. |
 | `idx_canonical_dishes_aliases` (GIN on TEXT[]) | Alias matching in search. |
-| `idx_products_normalized_name` (btree) | Brand-card grouping / brand-dish detail lookups. |
-| `idx_products_restaurant`, `idx_products_canonical_dish`, `idx_restaurants_chain` | The three hot join paths: branch menu, compare, brand's branches. |
-| `idx_products_active`, `idx_products_sold_out` (partial) | The `WHERE is_active` filter on almost every product query. |
-| `idx_products_category` / `_food_type` / `_price` / `_rating`; `idx_restaurants_city` / `_area` / `_rating` | Browse/filter paths (some speculative, cheap to keep). |
-| Review indexes on `restaurant_id`/`product_id`/`user_id`/`status` | Rating aggregation and "my review" lookups. |
+| `idx_products_normalized_name` (btree) | Brand-card grouping / brand-dish detail. |
+| `idx_products_restaurant`, `idx_products_canonical_dish`, `idx_restaurants_chain` | The three hot joins: branch menu, compare, brand's branches. |
+| `idx_products_active`, `idx_products_sold_out` (partial) | The `WHERE is_active` on nearly every product query. |
+| `idx_products_category/_food_type/_price/_rating`, `idx_restaurants_city/_area/_rating` | Browse/filter paths (some speculative, cheap to keep). |
+| Review indexes on `restaurant_id`/`product_id`/`user_id`/`status` | Rating aggregation, "my review" lookups. |
 
-### 4.10 Changing the schema
+### 2.11 Changing the schema
 
 **`schema.sql` builds FRESH databases. `migrations/` brings EXISTING ones up to date.** No Alembic, on purpose: Postgres-native features + a re-derivable catalogue made it overhead. But "reset and reload" stops being safe the moment there's one real user, so:
 
-> **Every schema change goes in BOTH places**: edit `schema.sql`, and add a new numbered, idempotent (`IF NOT EXISTS`) file in `migrations/`. Apply with `psql "$DATABASE_PUBLIC_URL" -f migrations/NNN_name.sql`. Currently there's one: `001_products_normalized_name.sql`.
+> **Every schema change goes in BOTH places**: edit `schema.sql`, *and* add a new numbered, idempotent (`IF NOT EXISTS`) file in `migrations/`. Apply: `psql "$DATABASE_PUBLIC_URL" -f migrations/NNN_name.sql`. Currently one exists: `001_products_normalized_name.sql`.
 
-**Geo is an optional add-on, not a migration.** `schema_geo.sql` adds `CREATE EXTENSION postgis`, a generated `geog GEOGRAPHY(Point,4326)` column derived from lat/long, and a GiST index — enabling `ST_DWithin` radius queries and `ORDER BY geog <-> point` nearest-first. Railway's Postgres **has no PostGIS** (verified), so `schema.sql` stays portable and geo applies only on a PostGIS host when "near me" ships. Raw coords are already populated for all 451 branches, so it's purely additive.
+**Geo is an optional add-on, not a migration.** `schema_geo.sql` adds `CREATE EXTENSION postgis`, a generated `geog GEOGRAPHY(Point,4326)` from lat/long, and a GiST index — enabling `ST_DWithin` radius and `ORDER BY geog <-> point` nearest-first. Railway has **no PostGIS** (verified), so `schema.sql` stays portable and geo applies only on a PostGIS host. Coords are already populated for all 451, so it's purely additive.
 
-⚠️ Adding a **product column that the pipeline writes** requires touching FIVE hardcoded lists in `load_batch.py`, and missing one fails *silently* — read [`HANDOFF.md` §9 trap 1](HANDOFF.md) before doing this.
+⚠️ Adding a **product column the pipeline writes** means touching FIVE hardcoded lists in `load_batch.py`, and missing one fails *silently*. Read [`HANDOFF.md` §9 trap 1](HANDOFF.md) first.
 
 ---
 
-## 5. The Python layer
+# Part II — The algorithms
 
-### 5.1 `database.py` — engine & sessions (34 lines)
+## 3. Algorithms & methods
 
-Resolution order for the connection string: `USE_SQLITE=1` → local SQLite file (import-check convenience only — the real schema won't apply there); else **`DATABASE_PUBLIC_URL`** (Railway public proxy); else `DATABASE_URL`.
+Five algorithms do the real work. They run in two different places, and the distinction matters:
 
-⚠️ It calls `load_dotenv()` at import: `.env`'s `DATABASE_PUBLIC_URL` silently wins over an exported `DATABASE_URL`. Any script that must target a non-production DB has to **SET** `os.environ["DATABASE_PUBLIC_URL"]` (not pop it) *before importing* — `load_dotenv` won't override an already-set variable. Getting this wrong once wrote test rows into production. Tests use the `temp_db` fixture in `tests/conftest.py`, which handles it; don't roll your own.
+| | Runs | Where | Output |
+|---|---|---|---|
+| [§3.1](#31-food-types--sub-types-classification) Classification | Offline, per load | `classify_batch.py` | `products.food_type_id` etc. |
+| [§3.2](#32-brands--restaurants-chain-identity) Brand identity | Offline, per load | `bootstrap_chains.py` | `restaurant_chains` rows |
+| [§3.3](#33-canonical-dishes-the-compare-identity) Canonical dishes | Offline, per load | `bootstrap_canonical_dishes.py` | `canonical_dishes` rows |
+| [§3.4](#34-comparing-dishes-brand-cards-search-compare) Brand cards / search / compare | **Per request** | `brand_dishes.py`, `dish_detail.py` | `BrandDishOut` cards |
+| [§3.5](#35-ratings-pooling--the-display-rule) Rating resolution | **Per request** | `restaurant_reviews.py` | `display_rating` trio |
 
-`get_db()` is the FastAPI dependency yielding one session per request.
+### 3.0 The one function to understand first: `canonical_match_key()`
 
-### 5.2 `models.py` — the thin ORM (314 lines)
+Lives in `bootstrap_canonical_dishes.py`. **It is the shared vocabulary of the entire system** — three separate layers import it, which is what makes them agree on what "the same dish name" means.
 
-One SQLAlchemy class per table, mirroring `schema.sql` exactly — mappings only, **no DDL authority** (§3.1). Only two things aren't pure mirroring:
+```
+canonical_match_key("Chicken Biriyani (Half) - 500gm")
+  1. normalize_name    strip size tokens, punctuation, prefixes
+                       → "chicken biriyani"
+  2. spelling map      phrase normalizations, then per-token SPELLING_MAP
+                       biriyani→biryani, pulao→polao, cookies→cookie, kabab→kebab
+                       → "chicken biryani"
+  3. stopword removal  drop with/and/the/a/an/of
+  4. token sort        → "biryani chicken"      ← the key
+```
 
-- `User.username` / `User.hashed_password` — read-only `@property` aliases for the v1 names (`display_name` / `password_hash`), kept so older serialization code works. Writes use the real column names.
-- The geo `geog` column is deliberately unmapped (would need geoalchemy2; it's generated anyway — geo queries will be raw SQL).
+Token-sorting means "Chicken Biryani" and "Biryani Chicken" produce the same key. The three consumers:
 
-Relationship cascades mirror the DB: deleting a `Restaurant` ORM object cascades to products → variations/reviews. That's what makes `DELETE /branches/{id}` genuinely destructive (§8).
-
-### 5.3 `schemas.py` — the API contract (36 Pydantic models)
-
-This file **is** the frontend contract; `khawon-web/src/types/api/` mirrors it in TypeScript. Change a response model → update the TS mirror → `npm run typecheck`.
-
-Field-by-field, grouped by domain. "←" = where the value comes from.
-
-#### Auth
-| Model | Fields | Notes |
-|---|---|---|
-| `UserCreate` | `email: EmailStr`, `username` (3–50), `password` (6–128) | Request body for register. `username` → stored as `display_name`. |
-| `UserOut` | `id`, `email`, `username`, `created_at` | `username` ← the ORM alias for `display_name`. |
-| `Token` | `access_token`, `token_type="bearer"` | JWT, 7-day default expiry. |
-
-#### Taxonomy
-| Model | Fields | Notes |
-|---|---|---|
-| `FoodTypeOut` | `id`, `name`, `description`, `image_url`, `parent_id` | Last three are **always `None`** — kept for v1 contract compat (the columns were dropped, §4.2). |
-| `FoodTypePopularOut` | + `restaurant_count`, `review_count`, `average_rating` | Stats derived live: distinct restaurants with an active product of the type; approved product-review stats over those products. |
-| `FoodSubTypeOut` | `id`, `name`, `food_type_id`, `dish_count`, `image_urls[]` | `dish_count` = active products; `image_urls` = deduped pool (≤20) of member product images for UI cycling. |
-| `FoodSubTypeListResult` | `food_type`, `sub_types[]` | |
-| `CuisineOut` | `id`, `name` | |
-| `FlavorTagOut` | `id`, `name` | `name` ← `flavor_tags.label` (the slug is not exposed). |
-
-#### Brands, branches & dishes
-| Model | Fields | Notes |
-|---|---|---|
-| `BrandOut` | `id`, `slug`, `name` | The brand stamp on every card. **Link with `slug`**; `id` (chain_id) is for POST bodies only. |
-| `BrandListOut` | `id`, `slug`, `name`, `branch_count`, `areas[]`, `image_url`, `food_types[]`, `cuisines[]` (names), `display_rating`, `display_rating_source`, `display_review_count` | One brand in browse. `areas` ← distinct branch areas; `image_url` ← first branch hero; `food_types`/`cuisines` ← union over branches; rating trio ← §7.5. |
-| `BrandDetailOut` | `id`, `slug`, `name`, `branch_count`, `branches[]: RestaurantSummaryOut`, `display_rating`, `display_review_count`, `display_rating_source` | The brand page. `display_review_count` is **the count behind `display_rating`, same source** — pairing a rating with a count from a different source is the bug that once rendered "4.9 · 0 reviews". |
-| `RestaurantSummaryOut` | `id`, `name`, `area`, `address`, `image_url`, `google_place_id`, `display_rating`, `display_rating_source` | A **branch** in embedded contexts. `id` here is a branch-row id → `/branches/*` only. |
-| `BranchResolveOut` | `id`, `chain_id`, `chain_slug`, `name`, `area`, `address`, `phone`, `google_place_id`, `image_url` | Resolves branch → brand so old numeric branch links redirect to `/restaurants/{chain_slug}`; also backs the branch edit form. |
-| `BrandDishOut` | `brand: BrandOut`, `food_type_id`, `slug`, `name`, `description`, `image_url`, `category_raw`, `food_type`, `cuisines[]`, `flavor_tags[]`, `canonical_dish_id`, `price_min_bdt`, `price_max_bdt`, `price_varies`, `branch_count`, `brand_branch_total`, `is_sold_out_everywhere`, `average_rating`, `review_count` | **The workhorse card** (§7.1). `slug` = slugified `normalized_name`; `(brand.id, food_type_id, slug)` is the card's natural key. Prices **always present**: `price_varies=False` ⇒ min == max, UI shows one number — one rule, no branching. `branch_count`/`brand_branch_total` → the "at 2 of 3 branches" badge (suppress when equal). Rating pooled across branches, approved only. |
-| `BrandDishDetailOut` | + `branches[]: BrandBranchOut` | Card + per-branch breakdown. |
-| `BrandBranchOut` | `restaurant_id`, `restaurant_name`, `area`, `product_id`, `price_bdt`, `is_sold_out`, `average_rating`, `review_count` | One branch serving the dish. `product_id` is what `POST /reviews` takes — dish reviews target ONE branch's row. |
-| `DishOut` | `id`, `name`, `description`, `price_bdt`, `image_url`, `is_sold_out`, `is_active`, `category_raw`, `variations[]`, `food_type`, `canonical_dish_id`, `cuisines[]`, `flavor_tags[]`, `restaurant: RestaurantSummaryOut`, `average_rating`, `review_count` | A single **product** row (one branch's dish) — dish detail and branch-menu contexts. Rating ← approved product reviews for this row only. |
-| `DishVariationOut` | `label`, `price_bdt` | |
-
-#### Canonical / compare / search
-| Model | Fields | Notes |
-|---|---|---|
-| `CanonicalDishOut` | `id`, `name`, `food_type`, `aliases[]`, `image_url` | |
-| `CanonicalDishMatch` | + `restaurant_count`, `dish_count`, `average_rating`, `min_price_bdt`, `max_price_bdt` | Search's compare strip. `restaurant_count` counts **brands** (distinct chain_id); `image_url` ← random pick from member-product image pool. |
-| `DishCompareResult` | `canonical_dish`, `dishes[]: BrandDishOut`, `total`, `offset`, `limit`, `average_rating`, `min_price_bdt`, `max_price_bdt` | Compare view: **one row per brand**. Aggregates span all rows, not just the page. |
-| `DishSearchResult` | `query`, `canonical_matches[]` (≤10), `dishes[]: BrandDishOut`, `total`, `offset`, `limit` | The core search response. `total` counts **brand cards**, not product rows. |
-| `FoodDetailResult` | `food_type: FoodTypePopularOut`, `restaurants[]: BrandListOut` | Food-type page: brands serving the type. |
-
-#### Reviews
-| Model | Fields | Notes |
-|---|---|---|
-| `ReviewCreate` | `dish_id`, `rating` (1–5), `comment` | `dish_id` = a **product** id (one branch's row). |
-| `ReviewOut` | `id`, `dish_id`, `restaurant_id`, `dish_name`, `username`, `rating`, `comment`, `is_verified`, `created_at` | `restaurant_id` derived through the product; `comment` ← `body`; `is_verified` ← `is_verified_order`. |
-| `RestaurantReviewCreate` | `branch_id`, `rating`, `comment` | Brand comes from the URL path; `branch_id` says which location was visited (validated to belong to the brand). |
-| `RestaurantReviewOut` | `id`, `restaurant_id`, `branch_name`, `branch_area`, `username`, `rating`, `comment`, `is_verified`, `created_at` | Branch name/area let the UI tag pooled brand reviews by location. |
-| `ReviewListResult` / `RestaurantReviewListResult` | `reviews[]`, `total`, `offset`, `limit` | |
-
-#### Pagination wrappers & misc
-| Model | Notes |
+| Consumer | Uses it for |
 |---|---|
-| `RestaurantCatalogueResult` | `restaurants[]: BrandListOut`, `total`, `offset`, `limit` — GET /restaurants. |
-| `BranchListResult` | `branches[]: RestaurantSummaryOut`, `total`, `offset`, `limit` — GET /branches. |
-| `PlaceSearchResult`, `PlacePhotoOut` | Google Places proxy shapes (contribute flow). |
-| `FoodImageSearchResponse`, `FoodImageSearchResult` | AI food-image generation shapes; `search_help` carries setup guidance when HF isn't configured. |
+| `consolidate_variants.py` | Merging one restaurant's size-rows |
+| `load_batch.py` | Writing `products.normalized_name` → **the brand-card key** |
+| `bootstrap_canonical_dishes.py` | Grouping products into canonical dishes |
+
+**Extend `SPELLING_MAP` and all three layers inherit it on the next load.** That is the intended way to improve matching today.
 
 ---
 
-## 6. How data gets IN — the pipeline
+### 3.1 Food types & sub types (classification)
 
-Five offline stages, all deterministic and re-runnable. Full run commands: [`HANDOFF.md` §10](HANDOFF.md). Scripts currently exist both in this repo (authoritative) and next to the data in `…\strip data\code\` (working copy) — **edit the repo copy, then copy over**; this duplication is a known hazard (see §12).
+**Where:** `classify_batch.py` (~1,120 lines, lives in the data folder — see [§11](#11-known-gaps--deferred-work)). It's a keyword/regex classifier — an explicit stand-in for eventual LLM classification, built so the taxonomy could be validated against real data first.
 
-### 6.1 `classify_batch.py` — taxonomy assignment
-Input: stripped scrape JSON. Output: `*_products.json` + `*_restaurants.json` per area. Assigns the four taxonomy dimensions via ordered rule lists (`FOOD_TYPE_RULES`, first match wins — the rule *order* implements "format wins over garnish", §4.2) plus flavor tags. 100% food_type coverage on real data.
+#### The algorithm
 
-### 6.2 `consolidate_variants.py` — size-row merge
-**Problem:** foodpanda is inconsistent about sizes. Usually sizes are one product's `variations[]`; for ~420 dishes each size is a *separate product row* ("Steamed Chicken Momo 5 Pcs / 6pcs / 7 Pcs…"). Left alone, those rows would (a) collapse into a canonical dish whose "price range" is really one restaurant's portion ladder, and (b) sometimes carry *different classifications* for the same dish.
+```
+classify_product(name, category_raw, description, restaurant_cuisines, restaurant_name)
+│
+├─ 1. is_non_food_item()?          → drop (7 rows dropped from 16,925 scraped)
+├─ 2. is_combo_item()?             → classify_combo()   [short-circuits everything below]
+└─ 3. classify_standalone()
+      │
+      ├─ Tier 1: match_food_type(name + category_raw)     ← FIRST
+      ├─ Tier 2: match_food_type(name + category_raw + description)  ← fallback only
+      ├─ Tier 3: protein_curry_fallback(text)             ← bare protein, no format
+      ├─ Tier 4: category_raw section signals             ← last resort
+      └─ Tier 5: restaurant-name namesake                 ← guarded
+```
 
-**Fix:** group by `(restaurant, canonical_match_key(name))` — the same key the canonical layer uses, so spelling-drifted size rows ("Chaap Polao Half" vs "Chap Pulao - Full") merge here rather than surviving as duplicates. 2+ rows for one dish → single product whose `variations[]` carries each size as a labelled price point; classification resolved by majority vote; description = longest; sold-out = only if *all* sizes are. Because grouping is strictly per-restaurant, the looser key can't fuse different brands' dishes. 16,918 → 16,385 products.
+**Every step exists because of a real bug. The reasoning:**
 
-### 6.3 `bootstrap_chains.py` — brand identity
-Groups branches into brands by **normalized name** (lowercase, strip ` - <branch>` suffixes, strip ~40 known area tokens, strip punctuation/outlet numbers) → `chains.json` (slug, display name, member codes).
+**Rule order = the "format wins over garnish" principle.** `match_food_type` walks `FOOD_TYPE_RULES` (a `(food_type, sub_type, [regex])` list) and **the first match wins**. So the *order of the list is the algorithm*:
 
-- The source `chain_code` is **not** the grouping key — it's wrong for ~21% of real brands (splits Waffle Up across two codes; misses Habanero entirely). It's a signal only.
-- `BRAND_OVERRIDES: {source_code → slug}` pins exceptions — same slug forces a merge, different slug forces a split. **Currently empty**: normalization got all 53 multi-location groups right, owner-reviewed via `--review` mode (prints candidate groups, writes nothing).
-- Display name comes from **branch names** with location stripped *case-preservingly* (`strip_location`: `KOI Thé`, `Domino's Pizza` survive); most-common wins, ties break shorter. The scraped `chain_name` is never used (contaminated — see §4.3).
+- Rice patterns sit **before** Kebab patterns → `"Chicken Dum Biryani with Egg & Jali Kebab"` → **Rice**, not Kebab.
+- Wraps & Rolls **before** Kebab → `"Chicken Seekh Kabab Roll"` → **Wraps & Rolls**.
+- Ramen/Sushi/Taco sit **first** so `"Sushi Roll"` isn't stolen by Rice's `\bbowl\b`/roll patterns.
 
-### 6.4 `bootstrap_canonical_dishes.py` — the compare layer
-Groups products by `(food_type, canonical_match_key(name))`; promotes a group to a canonical dish only when it spans **≥ 2 brands** (via chains.json). Set Menu excluded. Then a conservative fuzzy pass merges near-identical keys *within a food type* (SequenceMatcher ≥ 0.92) — but **never** across different protein tokens (chicken ≠ beef) or distinct modifiers (shahi ≠ plain ≠ bbq), so "Chicken Biryani" and "Beef Biryani" can't fuse. Output carries majority-vote taxonomy + `member_source_product_ids` for linking.
+Only genuinely standalone plates (*Chicken Sheek Kebab*) reach the bare Kebab rules. Several real bugs came from getting this order wrong — **if you add a rule, position is the decision**.
 
-**`canonical_match_key()` is the shared vocabulary of the whole system**: size-token strip → phrase + spelling map (`biriyani→biryani`, `pulao→polao`, plural folding) → stopword removal → sorted tokens. It's imported by both `consolidate_variants` and `load_batch` (which stores it as `products.normalized_name`), so the consolidation, brand-card, and canonical layers all agree on what "the same dish name" means. Extend the `SPELLING_MAP` there and every layer inherits it on the next load.
+**Tier 1 before tier 2 (name before description)** — descriptions are free-text prose that mention unrelated preparations. *"BBQ Chicken Sandwich"*'s description says the chicken is "charcoal grilled", which must not override the dish's actual format (Sandwich). So the description is consulted *only* when name + section find nothing.
 
-### 6.5 `load_batch.py` — the idempotent loader
-`python load_batch.py consolidated.json canonical_dishes.json "restaurants_*.json" --chains chains.json`. Three committed phases:
+**Tier 3, protein fallback** — a dish naming a protein but no format (*"Chicken With Basil Leaf"*, *"Prawn Achari"*) defaults to **Curry** with that protein as sub type. Poultry (duck, pigeon) folds into `Chicken`; all seafood into `Fish` — both too low-volume to justify their own sub types.
 
-1. **Lookups, brands, restaurants.** Get-or-create lookup rows from the data (taxonomy tables grow on demand). Upsert brands by slug; upsert restaurants by `source_restaurant_code` (area derived from each file's name); rebuild `restaurant_cuisines`; delete orphan chains.
-2. **Products.** Upsert by `source_product_id` with **change detection**: a signature tuple of every written column is compared against the existing row; unchanged rows are skipped (makes reloads fast, ~50s, and writes minimal). Changed rows update via a single-round-trip `unnest` bulk SQL. Vanished products (in DB, not in this batch, belonging to this batch's restaurants) → `is_active = FALSE` — never deleted. Variations and flavor-tag links are delete-and-rebuilt for the batch's products.
-3. **Canonical dishes.** Full replace: null all links, wipe the table, reinsert, relink members by `source_product_id`.
+**Tier 5's guard** — a restaurant-name fallback (Pizza Hut's unmatched items → Pizza) over-fired: pizza places file genuine drinks/sides/curries under sections like "Beverages"/"Fish Items". `_is_non_namesake_section()` blocks the fallback for ~20 section signals.
 
-⚠️ The change-detection design is also its trap: the written-columns list is hardcoded in **five places**, and missing one silently makes a column un-backfillable or makes the load report success while writing nothing. Both happened. Regression tests pin it. Details: [`HANDOFF.md` §9 trap 1](HANDOFF.md).
+#### Sub types are per-type by design
 
-Safe to re-run anytime; user data (users/reviews) and user-contributed branches are untouched (user branches aren't in any batch, so the deactivation sweep never reaches their products).
+The differentiator that matters **depends on the type**, so `food_sub_types` is scoped under `food_type_id`:
+
+| Food Type | Sub type is… | Values |
+|---|---|---|
+| Curry, Grill, Fried, Soup | protein | Chicken, Beef, Fish, Vegetable… |
+| Rice | format | Biryani/Kacchi, Fried Rice, Tehari, Khichuri, Rice Bowl, Plain Rice/Polao |
+| Momo/Dumpling | preparation | Fried, Soup, Steamed |
+| Beverages | drink kind | Tea, Coffee, Juice… |
+| Set Menu | primary component | picked via `PRIMARY_PRIORITY` |
+
+**Flavor/style modifiers are NEVER a sub type** (BBQ, Spicy, Cheese, Naga, steak cuts) — those are `flavor_tags`, a multi-label dimension. Mixing them in would multiply sub types combinatorially.
+
+#### Combos get their own path
+
+Detected first (via the foodpanda section label, backed by name patterns) and **short-circuit the main pass**. 97.5% have a structured *"Consists of X, Y & Z"* description: it's parsed, each component run through **the same** `match_food_type`, and every distinct type collected into `contains_food_types`. Then:
+
+- `food_type` = always **Set Menu** (one browsable bucket)
+- `sub_type` = the single most substantial component, via `PRIMARY_PRIORITY` (Rice/Curry/Grill beats Fries/Beverages)
+- `category` = meal role derived from that same primary component
+
+`contains_food_types` (the multi-component breakdown) is **deliberately not imported** into the DB — owner's call: a Set Menu row is its name, price, and primary type. Set Menu items are also **excluded from canonical dishes** entirely ([§3.3](#33-canonical-dishes-the-compare-identity)).
+
+#### Category & cuisine
+
+- **Category** — food-type overrides first (`Beverages`→Drinks, `Dessert`→Dessert), else keyword-match the raw menu section, else default **Main Dish**.
+- **Cuisine** — most-specific-first: `(food_type, sub_type)` defaults (`(Rice, Biryani/Kacchi)`→Bangladeshi, `(Rice, Fried Rice)`→Chinese) → food-type defaults (Pizza→Italian, Ramen→Japanese) → text match → the restaurant's own cuisine tags. `"Asian"` is used **only** where the format is genuinely pan-Asian (Momo/Dumpling, Rice Bowl) — not as a dumping ground.
+
+**Result:** 100% food_type coverage, 0 unmatched, across 16,918 classified products.
 
 ---
 
-## 7. How data gets OUT — read-time assembly
+### 3.2 Brands & restaurants (chain identity)
 
-The interesting backend logic is here: base rows go in, product-shaped responses come out, per request.
+**Where:** `bootstrap_chains.py` (193 lines). **Job:** group 451 branches into 378 brands.
 
-### 7.1 Brand dish cards — `brand_dishes.build_brand_dishes()`
+#### Why the source's own chain_code is not the key
 
-Input: hydrated `Product` rows (any set). Groups by **`(chain_id, food_type_id, normalized_name)`** and emits one `BrandDishOut` per group:
+foodpanda ships a `chain_code`, and it is **wrong for ~21% of real brands**. It:
 
-- **Why `food_type_id` is in the key:** without it, a brand's "Chicken" *curry* fuses with its own "Chicken" *pizza* — same normalized name. There's a regression test pinning this.
-- `name` ← most common raw spelling among members; `image_url` ← first member with one; `description`/`category`/`cuisine`/`flavor_tags` ← first member (members are near-identical by construction).
-- `price_min/max` ← min/max of members' base prices; `price_varies` ← min ≠ max (true for only ~6.5% of multi-branch cards).
-- `branch_count` ← distinct restaurants among members; `brand_branch_total` ← the brand's total active branches (one grouped query for the whole batch).
-- `average_rating`/`review_count` ← **pooled** approved product reviews across members (sums fetched per product in one grouped query, pooled in Python).
-- `is_sold_out_everywhere` ← all members sold out.
+- **splits** brands across codes — Waffle Up (`cz5re` + `ch5ue`), New Hanif Biryani (`ck1ob` + `cr7gd`), Thai Bistro (`cy7dd` + `cq2yv`), Cafe Mario's, Tehari Ghar, Bhorta Bari;
+- **misses** them entirely — Habanero, Happy Potato, Hungry Pizza Lovers untagged; Rice & More has `chain_code=None` on one branch.
 
-Two grouped queries total per call — no N+1.
+So `chain_code` is a **signal only, never the grouping key**. The column named `chain_code` in the DB holds our own derived slug, not foodpanda's.
 
-### 7.2 Brand browse — `brand_browse.py`
+#### The algorithm
 
-`matching_chain_ids(q)`: chains with ≥1 active branch, filtered by brand/branch/area/address `ILIKE`, ordered by name. `build_brand_list(chain_ids)`: assembles `BrandListOut` cards in a fixed number of grouped queries (chains, branches, food types via products, cuisines, review stats).
+```
+build_brands(restaurants)
+│
+├─ for each restaurant:
+│    slug = BRAND_OVERRIDES[source_code]              ← pinned exception, if any
+│           or brand_slug(normalize_brand_name(name)) ← the normal path
+│           or brand_slug(source_code)                ← degenerate name → brand of one
+│    groups[slug].append(restaurant)
+│
+└─ for each group → {slug, name: _display_name(members), member_codes: [...]}
+```
 
-### 7.3 Search — `dish_detail.search_dishes()` + `search_canonical_dishes()`
+**`normalize_brand_name()` — build the match key** (this is a *key*, not a label):
 
-`GET /dishes/search?q=` returns two independent lists:
+```
+"Waffle Up - Dhanmondi"
+  1. lowercase, trim                    → "waffle up - dhanmondi"
+  2. split on first " - " (branch suffix) → "waffle up"
+  3. split on "- " (no leading space: "Ledor- Dhanmondi") 
+  4. strip punctuation (keep & and digits)
+  5. strip ~40 AREA_TOKENS, LONGEST FIRST → so "gulshan avenue"
+     is removed before "gulshan" would match inside it
+  6. drop trailing outlet number ("gulshan 2" → already lost "gulshan" → drop "2")
+                                        → "waffle up"     ← the key
+```
 
-1. **`canonical_matches`** (capped 10): canonical dishes whose name, aliases, or food type match — the "compare across restaurants" strip, ordered by brand spread.
-2. **`dishes`**: paginated brand cards. The clever part is *what gets hydrated*: a lightweight query fetches only `(id, name, chain_id, food_type_id, normalized_name)` for every match (own name, food-type name, or canonical name `ILIKE`); rows are grouped into cards **before** pagination (so `total` counts cards, not branch rows); groups are ranked exact < prefix < substring < matched-via-type; and only the requested page's groups get the full joinedload hydration + card build. A broad query like "chicken" never hydrates thousands of rows.
+Both `"Waffle Up - Dhanmondi"` and `"Waffle Up"` land on `waffle up` → `brand_slug()` → `waffle-up`. Same brand, merged.
 
-Coming up empty returns empty lists, not 404 — no results is a normal state.
+**`BRAND_OVERRIDES: {source_code → slug}`** — one mechanism, both directions: assign the **same** slug to force a merge, a **different** slug to force a split. It is **currently empty** — normalization got all 53 multi-location groups right, owner-reviewed via `--review` mode (prints candidate groups and flags where the source chain_code disagrees; writes nothing).
 
-### 7.4 Compare — `get_canonical_dish_comparison()`
+**`_display_name()` — build the label** (a *different* job from the key):
 
-All active products linked to the canonical id → `build_brand_dishes` → **one row per brand** (a chain is `branch_count=3` on one row, not 3 rows — comparing a dish to itself across branches is not a comparison). Sorted best-rated first, paginated; headline min/max price and average rating computed across **all** rows, not just the page.
+The scraped `chain_name` is **never used for display** — it's contaminated. It named `"Rice Lab - Mirpur"` for a brand whose only branches are Uttara and Gulshan (there is no Mirpur branch in the data), and it bakes one area into multi-area brands (`"Delifrance Gulshan Avenue"` across Gulshan/Dhanmondi/Uttara).
 
-### 7.5 Display ratings — `restaurant_reviews.resolve_display_rating()`
+Instead, `strip_location()` does normalize_brand_name's job **for humans**: same area tokens, same suffix rules, but **case-, punctuation- and diacritic-preserving**. That's the whole point — the lowercased match key gives unusable text (`koi th`), while `strip_location` yields `KOI Thé`, `Domino's Pizza`, `Greens & Seeds`. Most common cleaned branch name wins; ties break toward the shorter label.
 
-The cold-start rule, resolved **server-side** so every UI surface agrees:
+**Why branch names self-validate:** independent branches of one brand agree with each other once the location is stripped. `chain_name` is a single unverifiable string.
+
+#### Worked example — Waffle Up
+
+| source_code | branch name | foodpanda chain_code | → normalized key | → slug |
+|---|---|---|---|---|
+| *(a)* | `Waffle Up - Dhanmondi` | `cz5re` | `waffle up` | `waffle-up` |
+| *(b)* | `Waffle Up` | `ch5ue` ⚠️ *different!* | `waffle up` | `waffle-up` |
+
+Trusting `chain_code` → **2 brands** (wrong). Grouping by normalized name → **1 brand**, display name `Waffle Up`, `branch_count = 2`. ✅
+
+---
+
+### 3.3 Canonical dishes (the compare identity)
+
+**Where:** `bootstrap_canonical_dishes.py` (329 lines). **Job:** decide which dishes are *the same dish* across different brands — 16,385 products → 1,431 canonical dishes.
+
+#### The algorithm
+
+```
+build_canonical_dishes(products, code_to_brand)
+│
+├─ 1. GROUP   by (food_type, canonical_match_key(name))
+│              — Set Menu excluded entirely; empty keys skipped
+│
+├─ 2. PROMOTE groups spanning ≥ MIN_BRANDS (=2) DISTINCT BRANDS
+│              — brand_of(product) = code_to_brand[source_restaurant_code]
+│              — an unmapped code becomes its own pseudo-brand (fail-safe)
+│
+├─ 3. FUZZY MERGE within each food_type (union-find):
+│        _can_merge_keys(a, b) requires ALL of:
+│          • same modifier set     (DISTINCT_MODIFIERS: shahi/bbq/plain/tikka…)
+│          • same protein signature (PROTEIN_TOKENS: chicken/beef/fish/veg…)
+│          • SequenceMatcher ratio ≥ 0.92
+│
+└─ 4. ATTRIBUTES per surviving group:
+         name    = most common raw spelling
+         aliases = every other observed spelling
+         sub_type/cuisine/category = MAJORITY VOTE across members
+```
+
+**Why each guard exists:**
+
+**Why `(food_type, key)` and not just `key`** — without food_type, "Chicken" the curry and "Chicken" the pizza are one group.
+
+**Why sub_type is NOT in the key** — the per-product classifier disagrees across restaurants on sub_type for the same dish (Beef Tehari: `Tehari` at one place, `Biryani` at another). Including it would fragment the group. Instead sub_type is resolved **after** grouping, by majority vote.
+
+**Why ≥ 2 *brands*, not 2 *restaurants*** — the single most important line in this file. Counting branches meant a chain-exclusive drink sold at 3 branches of one chain looked "comparable across restaurants" when nobody else on earth makes it. Counting brands dropped 2,527 → 1,431 canonical dishes ([§1.1](#11-two-grouping-layers-that-stack)).
+
+**What the fuzzy merge actually does** — verified by running the real functions, because the intuitive story is wrong:
+
+| Key pair | similarity | guards | merged? |
+|---|---:|---|---|
+| `chicken chowmein` / `chicken chowmien` *(typo)* | 0.938 | pass | ✅ **yes** — this is what it's for |
+| `chicken shawarma` / `chicken shawarmas` | 0.970 | pass | ✅ yes *(plural not in SPELLING_MAP)* |
+| `burger cheese chicken combo` / `burgar cheese chicken combo` | 0.963 | pass | ✅ yes |
+| `biryani chicken dum hyderabadi` / `biryani dum hyderabadi mutton` | 0.746 | protein blocks | ❌ no *(below threshold anyway)* |
+| `chicken tikka` / `chicken tika` *(typo)* | 0.960 | **modifier blocks** | ❌ **no — false block** |
+| `margherita` / `margherita pizza` | 0.769 | pass | ❌ **no — a real miss** |
+
+Two honest observations a co-creator should know:
+
+1. **The guards are defense-in-depth, not the hot path.** Token-sorting already spreads protein/modifier words apart enough that similarity usually falls below 0.92 on its own — `chicken biryani` vs `beef biryani` scores **0.519**, nowhere near merging. The guards exist for the long-name case where one swapped protein is a small fraction of the string, and for safety as the threshold is tuned.
+2. **The modifier guard causes false blocks.** `chicken tikka` vs `chicken tika` is a plain typo at 0.960 similarity, but `tikka` is in `DISTINCT_MODIFIERS` and its typo isn't — so the modifier sets differ and the merge is blocked. Same for `grilled` vs `grill`. The fix is a spelling-map entry, not a threshold change.
+
+Ordering is deliberate: cheap set comparisons run before the expensive `SequenceMatcher`.
+
+**Why majority vote for attributes** — gives one stable value so a dish doesn't flicker in and out of a cuisine/category filter as you page through restaurants whose classifiers disagreed. Products keep their own raw values.
+
+**Why Set Menu is excluded** — a combo is a restaurant-specific bundle. "Family Feast" at two restaurants is two different sets of food; comparing their prices would be nonsense.
+
+**Unpromoted dishes are NOT lost** — `canonical_dish_id` stays NULL and the dish remains fully searchable and browsable via food_type. It just isn't offered as a comparison. ~57% of eligible products link to a canonical dish; the rest are single-brand dishes.
+
+#### Worked example — French Fries *(live data, canonical id 14218)*
+
+```
+Grouping:  ("Fries", "fries french")        ← token-sorted key
+Members:   69 products across 61 DISTINCT BRANDS   → 61 ≥ 2 → PROMOTED
+Name:      "French Fries"                   ← most common raw spelling
+Aliases:   ["French Fries - Large"]         ← other observed spelling, searchable
+Prices:    75.65 – 409.50 BDT               ← the comparison payload
+```
+
+That 5.4× price spread across 61 brands **is the product**. And note the 69 products → 61 brands: 8 of those are extra branches of chains, which the *brand card* layer collapses so compare shows one row per brand ([§3.4](#34-comparing-dishes-brand-cards-search-compare)).
+
+#### What it still misses — a live example worth fixing
+
+Search the DB for Margherita and you get **four** canonical dishes, not one:
+
+| id | name | brands | products | price range |
+|---:|---|---:|---:|---|
+| 14449 | `Margherita` | 3 | 5 | 199 – 648 |
+| 14450 | `Margherita Pizza` | **12** | 18 | 195 – 900 |
+| 14437 | `Classic Margherita` | 2 | 4 | 551 – 666 |
+| 14438 | `Classic Margherita Pizza` | 4 | 5 | 342 – 1320 |
+
+These are the same dish, fragmented across four comparison identities — so a diner comparing Margherita sees 12 brands where they should see ~20. Why: `margherita` vs `margherita pizza` scores 0.769, below the 0.92 threshold; and `classic` is a `DISTINCT_MODIFIER`, so the "Classic" variants are blocked outright.
+
+**This is the system working as designed, not a bug** — the exact-key + guarded-fuzzy approach is deliberately conservative, because a wrong merge is far worse than a missed one: a missed merge still leaves both dishes fully searchable and browsable, while a wrong merge tells a diner two different foods are the same. But it is the clearest available illustration of the ceiling this approach has, and why pgvector/LLM matching is the planned upgrade ([§11](#11-known-gaps--deferred-work)). `aliases[]` is the landing zone.
+
+**If you want to improve matching today**, the levers in order of safety: add to `SPELLING_MAP` ([§3.0](#30-the-one-function-to-understand-first-canonical_match_key) — every layer inherits it) → add a `PHRASE_NORMALIZATIONS` entry → reconsider a specific `DISTINCT_MODIFIERS` member → last resort, touch `FUZZY_MERGE_THRESHOLD` (global blast radius; re-check the whole canonical count before and after).
+
+---
+
+### 3.4 Comparing dishes (brand cards, search, compare)
+
+This is where the product's core promise gets assembled — **entirely at read time**, per request.
+
+#### 3.4.1 Brand cards — `brand_dishes.build_brand_dishes()`
+
+The dedupe that makes "one Domino's, not three" work. Takes any set of hydrated `Product` rows, returns `BrandDishOut[]`.
+
+**The key: `(chain_id, food_type_id, normalized_name)`**
+
+```
+build_brand_dishes(db, products)
+│
+├─ 1. GROUP products by brand_key(p) = (p.restaurant.chain_id,
+│                                       p.food_type_id,
+│                                       p.normalized_name)
+├─ 2. Two grouped queries for the whole batch (never per-card — no N+1):
+│       _branch_totals(chain_ids) → the "3" in "at 2 of 3 branches"
+│       _review_stats(product_ids) → (sum_rating, count) APPROVED only,
+│                                    summed so the caller can pool
+└─ 3. Per group → one card:
+       name         = most common raw spelling among members
+       image_url    = first member that has one
+       price_min/max= min/max of members' base_price_bdt
+       price_varies = min ≠ max          ← only ~6.5% of multi-branch cards
+       branch_count = distinct restaurant_ids among members
+       brand_branch_total = the brand's total active branches
+       average_rating/review_count = POOLED approved reviews across members
+       is_sold_out_everywhere = all members sold out
+```
+
+**Why `food_type_id` is in the key — it's load-bearing, not decoration.** Without it, a brand's "Chicken" *curry* fuses with its own "Chicken" *pizza* — identical `normalized_name`, same brand. The canonical bootstrap learned this the hard way; there's a regression test pinning it (`test_same_name_different_food_type_stays_separate`).
+
+**Why `normalized_name` and not `name`** — it's written by `load_batch` using `canonical_match_key()`, the same function the canonical layer groups with ([§3.0](#30-the-one-function-to-understand-first-canonical_match_key)). Both layers therefore agree on what "the same dish name" means, and brand dedupe inherits the spelling map for free.
+
+**Why price is always a range** — `price_min_bdt`/`price_max_bdt` are **always present**; when `price_varies` is false, min == max and the UI shows one number. One rule, no branching — a solo restaurant's card takes the identical path.
+
+**Union, not intersection.** A brand's menu is every dish *any* branch sells, badged "at 2 of 3 branches" (suppress the badge when `branch_count == brand_branch_total`). Intersection would silently delete ~⅓ of Domino's menu; union *without* the badge would send someone to Uttara for a pizza only Gulshan sells — breaking the trust promise.
+
+#### 3.4.2 Search — `dish_detail.search_dishes()` + `search_canonical_dishes()`
+
+`GET /dishes/search?q=` returns **two independent lists**:
+
+1. **`canonical_matches`** (capped 10) — the "compare these across restaurants" strip. Matches canonical name, **aliases**, or food-type name; ordered by brand spread (`-restaurant_count, -dish_count`) because comparison is the point.
+2. **`dishes`** — paginated brand cards, most-relevant first.
+
+**The performance shape of `search_dishes` is the interesting part:**
+
+```
+1. LIGHTWEIGHT fetch — only (id, name, chain_id, food_type_id, normalized_name)
+     WHERE is_active AND (product.name ILIKE %q%      ← pg_trgm
+                       OR food_type.name ILIKE %q%
+                       OR canonical.name ILIKE %q%)
+2. GROUP into brand cards  ← BEFORE paginating, so `total` counts CARDS not rows
+3. RANK groups: _search_rank = 0 exact | 1 prefix | 2 substring
+                             | 3 matched only via food_type/canonical
+                 tie-break alphabetically
+4. SLICE  page_keys = ordered_keys[offset : offset+limit]
+5. HYDRATE only the page's products (joinedload) → build_brand_dishes
+6. RESTORE relevance order (cards are keyed by slug, not normalized_name)
+```
+
+Steps 1 and 5 are the trick: a broad query like `"chicken"` matches thousands of rows, but only ~20 cards' worth get the full joinedload hydration. Grouping before paginating (step 2) is what makes `total` honest — it counts what the user sees (cards), not underlying branch rows.
+
+Coming up empty returns **empty lists, not 404** — no results is a normal state.
+
+#### 3.4.3 Compare — `get_canonical_dish_comparison()`
+
+```
+1. Load the canonical dish (404 if absent)
+2. Fetch ALL active products WHERE canonical_dish_id = :id
+3. build_brand_dishes(products)        ← ONE ROW PER BRAND
+4. Sort best-rated first (unrated last)
+5. Paginate the cards
+6. Headline aggregates (avg rating, min/max price) across ALL cards, not the page
+```
+
+**Why one row per brand:** comparing a dish to itself across three Domino's branches is not a comparison. Before this, compare showed 18 rows while claiming `restaurant_count = 12` — the count said brands, the rows said branches. Now both say brands and they agree (verified: Margherita Pizza, 12 = 12).
+
+#### 3.4.4 Brand dish URLs
+
+`/restaurants/{slug}/dishes/{food_type_id}/{dish_slug}` — a **natural key**, deliberately not a serial id, because a brand dish **is a grouping, not a row** (there's no id to use). `dish_slug = dish_slug(normalized_name)` — slugified. `food_type_id` must be in the URL for the same reason it's in the group key: without it, a brand's "Chicken" curry and "Chicken" pizza collide at one URL.
+
+---
+
+### 3.5 Ratings: pooling & the display rule
+
+**Where:** `restaurant_reviews.py`. Every rating in the API is computed live from **approved** reviews ([§4.3](#43-aggregate-at-read-time-store-no-derived-state)).
+
+#### The vocabulary (mixing these up makes the UI lie)
+
+| Field | Means |
+|---|---|
+| `average_rating` / `review_count` | **Khawon's own**, live from approved reviews |
+| `old_rating` / `old_review_count` *(DB)* | The **foodpanda scraped** rating |
+| `display_rating` / `display_review_count` / `display_rating_source` | **Server-resolved** — what the UI should actually render |
+
+#### `resolve_display_rating()` — the cold-start rule
 
 ```
 khawon has ≥1 approved review  → (khawon avg,  khawon count,  "khawon")
 else foodpanda rating exists   → (fp rating,   fp count,      "foodpanda")
-else                           → (None, 0, None)
+else                           → (None,        0,             None)
 ```
 
-For a **brand**, the khawon side pools location reviews across branches, and the foodpanda side is a review-count-weighted average of branch ratings (planned upgrade: nearest branch, once geo lands).
+Resolved **server-side** so every surface agrees, and `source` is returned so the UI can label a borrowed rating honestly.
 
-**The iron rule: rating, count, and source travel together.** `display_review_count` is the count *behind* `display_rating`, from the same source. Pairing a foodpanda rating with the khawon count (0) shipped a page reading "4.9 · 0 reviews" once. Never mix.
+> ⚠️ **The iron rule: rating, count, and source travel together.** `display_review_count` is the count *behind* `display_rating`, from the same source. This exact bug shipped: the brand page rendered **"4.9 · 0 reviews (Foodpanda)"** because it paired a foodpanda *rating* with the khawon review *total* (0). Never mix sources.
 
-The rating vocabulary across the API:
-- `average_rating`/`review_count` = khawon's own, live from approved reviews.
-- `old_rating`/`old_review_count` (DB) = scraped foodpanda values.
-- `display_*` = the resolved trio above.
+#### `brand_display_rating()` — pooling a brand from its branches
 
-### 7.6 Image pools — `product_image_pools.py`
+```
+khawon side:    review-count-weighted average of branches' approved reviews
+                Σ(branch_avg × branch_n) / Σ(branch_n)
+foodpanda side: review-count-weighted average of branches' old_rating
+                (falls back to the first branch's rating if all counts are 0)
+→ resolve_display_rating(khawon_avg, khawon_n, fp_avg, fp_n)
+```
 
-Sub-type tiles and canonical search cards don't store images; they serve a deduped pool (≤20) of member products' images in one grouped query — canonical matches pick randomly per request, sub-types return the pool for UI cycling. `dish_detail.normalize_product_image_url()` patches foodpanda URLs stored with an unresolved `?width=%s` template.
+**Why weighted, not a plain mean:** a branch with 500 reviews and one with 3 shouldn't count equally.
+
+**Planned change:** once geo lands, swap brand rating from weighted-average to **nearest branch** — you care about the Dhanmondi branch's rating when you're in Dhanmondi.
+
+Dish-level cards pool the same way ([§3.4.1](#341-brand-cards--brand_dishesbuild_brand_dishes)): sums and counts are fetched per product in one grouped query, then summed across the brand's branches in Python — `round(Σratings / Σcount, 1)`.
 
 ---
 
-## 8. API endpoint reference
+### 3.6 End-to-end: a real dish through the whole system
 
-40 routes. 🔒 = requires `Authorization: Bearer <JWT>`.
+Domino's Margherita, traced with **real values from the live database**. This is every algorithm above, in order.
 
-**The URL rule** (§3.4): `/restaurants/*` takes the brand **slug**; `/branches/*` takes branch-row ids; `/dishes/{id}` takes product ids; chain_id and branch_id appear in POST bodies only. Numeric `/restaurants/{int}` 404s **by design**.
+**Input — 3 rows from the scrape** (3 separate branches, 3 separate products):
+
+| branch | area | product name | price |
+|---|---|---|---|
+| Domino's Pizza - Dhanmondi | Dhanmondi | `Margherita` | 348.00 |
+| Domino's Pizza Gulshan | Gulshan | `Margherita` | 348.00 |
+| Domino's Pizza - Jashimuddin Avenue | Uttara | `Margherita` | **199.00** |
+
+**Offline pipeline:**
+
+| Stage | What happens |
+|---|---|
+| **classify_batch** | Name matches Pizza rules → `food_type = Pizza` (id 37), `cuisine = Italian` (food-type default), `category = Main Dish` (default), `sub_type = None`. *(All four verified as stored.)* |
+| **consolidate_variants** | Only one row per restaurant for this key → passes through unchanged |
+| **bootstrap_chains** | All 3 branch names normalize: `"Domino's Pizza - Dhanmondi"` → strip ` - ` suffix → strip area tokens `dhanmondi` / `gulshan` / `jashimuddin avenue` → `"domino s pizza"` → slug **`domino-s-pizza`**. Display name via `strip_location`, case-preserved: **`Domino's Pizza`**. → **1 brand, 3 branches** |
+| **bootstrap_canonical_dishes** | Key = `("Pizza", "margherita")`. Domino's contributes 1 brand; **2 other brands** sell a dish with the same key, so the group spans 3 brands ≥ MIN_BRANDS(2) → **promoted** → canonical **id 14449 `"Margherita"`** (3 brands, 5 products, 199–648tk). ⚠️ Note it did **not** absorb the 12-brand `"Margherita Pizza"` canonical — see the fragmentation example in [§3.3](#33-canonical-dishes-the-compare-identity) |
+| **load_batch** | Writes `normalized_name = "margherita"` on all 3 products (via `canonical_match_key`); all 3 get `chain_id` → the `domino-s-pizza` row; links all 3 to `canonical_dish_id = 14449` |
+
+**Live DB state — 3 rows** *(product ids 5787 / 16745 / 19715, verified)*:
+
+```
+chain_code='domino-s-pizza', name="Domino's Pizza"
+├─ branch "Domino's Pizza - Dhanmondi"        product Margherita 348.00 ft=37 norm='margherita' cd=14449
+├─ branch "Domino's Pizza Gulshan"            product Margherita 348.00 ft=37 norm='margherita' cd=14449
+└─ branch "Domino's Pizza - Jashimuddin Ave"  product Margherita 199.00 ft=37 norm='margherita' cd=14449
+```
+
+**Per request — `GET /restaurants/domino-s-pizza/menu`:**
+
+```
+1. Resolve slug 'domino-s-pizza' → chain_id
+2. Fetch active products for the brand's branches (joinedloaded)
+3. build_brand_dishes → group by (chain_id, 37, 'margherita') → all 3 collapse
+4. Emit ONE card:
+     brand: {slug: "domino-s-pizza", name: "Domino's Pizza"}
+     slug: "margherita"   food_type_id: 37
+     price_min_bdt: 199.00   price_max_bdt: 348.00   price_varies: TRUE
+     branch_count: 3   brand_branch_total: 3     → badge suppressed (equal)
+     average_rating: null   review_count: 0        → pre-launch
+```
+
+**What the user sees:** *"Margherita — 199–348tk — Domino's Pizza"* — one card, not three. And the price range is real: Uttara genuinely sells it 43% cheaper. That's a *feature* surfaced by the dedupe, not noise hidden by it.
+
+**And in compare** (`GET /dishes/compare/14449`): Domino's occupies **one row** with `branch_count = 3`, sitting next to the other brands selling that canonical dish — each also one row. That's the product.
+
+**One honest caveat this trace exposes:** compare on 14449 shows 3 brands, but ~12 more brands sell the same dish under canonical 14450 (`"Margherita Pizza"`). The dedupe and comparison machinery is working perfectly; the *matching* is what's leaving value on the table. That's the single highest-leverage improvement available ([§3.3](#33-canonical-dishes-the-compare-identity)).
+
+---
+
+# Part III — Reference
+
+## 4. Design principles
+
+The five rules that explain the structure above. Check new work against these.
+
+### 4.1 SQL-first: `schema.sql` is the source of truth, not the ORM
+The schema uses Postgres-native features the ORM can't express: trigram GIN indexes, `TEXT[]` with GIN, partial indexes, a generated `GEOGRAPHY` column. So `schema.sql` **creates** the DB; `models.py` is a thin mapping over tables that already exist; `main.py` must **never** call `create_all()` (it used to — removed deliberately). Changes go in `schema.sql` **and** `migrations/` ([§2.11](#211-changing-the-schema)).
+
+### 4.2 The pipeline owns catalogue data; the DB is derived
+Curated data (taxonomy rules, spelling maps, brand overrides) lives in **pipeline code**, never as hand-edited rows. The DB is reloaded from pipeline output; anything typed into the database is overwritten or orphaned next load. To fix a wrong classification, fix the rule in `classify_batch.py` and re-run — don't `UPDATE` the row.
+
+The exceptions the pipeline must never clobber: `users`, both review stacks, and user-contributed branches (`source_restaurant_code` starting `user-`).
+
+### 4.3 Aggregate at read time; store no derived state
+Brand cards, pooled ratings, price ranges, availability badges, food-type stats — all computed per request. Nothing denormalized. Hence **no `chain_dishes` table** (the card is a grouping over `products`, which must exist anyway for per-branch reviews, availability, future map pins), and `products.rating`/`restaurants.rating` are **reserved and unmaintained**.
+
+Payoff: correctness by construction — no cache to invalidate, no stale aggregate, no rebuild job. At 16k products and pre-launch traffic it's comfortably fast. The reserved columns mean denormalizing later is a migration, not a redesign. Revisit only with evidence.
+
+### 4.4 Natural keys in URLs; serial ids never leave POST bodies
+Reloads churn serial ids (canonical dishes are fully rebuilt). Worse, `restaurants.id` and `restaurant_chains.id` are **separate sequences that overlap numerically** — `/restaurants/296` once served *Bella Italia* (chain 296) when handed branch row 296 (*Pizzolo Caffe*): a **silent wrong-restaurant bug with no 404 to catch it**. A slug can't be mistaken for either id space, so the failure is impossible by construction rather than avoided by discipline.
+
+| Key | Used for |
+|---|---|
+| `chain_code` (brand slug) | every `/restaurants/*` URL |
+| `(food_type_id, dish_slug)` | brand-dish URLs |
+| `source_product_id`, `source_restaurant_code` | pipeline upsert identity |
+| serial ids | POST bodies (`branch_id`, `dish_id`) and internal FKs only |
+
+Numeric `/restaurants/{int}` now **404s by design**.
+
+### 4.5 Soft delete for products; union-with-badge for availability
+A re-scrape that no longer sees a product sets `is_active = FALSE`, **never** `DELETE` — `product_reviews` cascades, so a hard delete would silently destroy user reviews of a dish that's merely off the menu this week. And a brand's menu is the **union** of its branches', badged ([§3.4.1](#341-brand-cards--brand_dishesbuild_brand_dishes)).
+
+## 5. The Python layer
+
+### 5.1 `database.py` (34 lines)
+Connection resolution: `USE_SQLITE=1` → local SQLite (import checks only — the real schema won't apply); else **`DATABASE_PUBLIC_URL`**; else `DATABASE_URL`. `get_db()` yields one session per request.
+
+⚠️ It calls `load_dotenv()` at import, so `.env`'s `DATABASE_PUBLIC_URL` **silently wins** over an exported `DATABASE_URL`. To target a non-production DB you must **SET** `os.environ["DATABASE_PUBLIC_URL"]` (not pop it) *before importing* — `load_dotenv` won't override an already-set var. Getting this wrong once wrote test rows into production. Use the `temp_db` fixture; don't roll your own.
+
+### 5.2 `models.py` (314 lines)
+One SQLAlchemy class per table, mirroring `schema.sql` — mappings only, **no DDL authority**. Two deliberate deviations: `User.username`/`User.hashed_password` are read-only `@property` aliases for `display_name`/`password_hash` (v1 compat; writes use the real names), and the geo `geog` column is unmapped (generated; geo queries will be raw SQL). Relationship cascades mirror the DB — which is what makes `DELETE /branches/{id}` genuinely destructive.
+
+### 5.3 `schemas.py` — the API contract (36 Pydantic models)
+This file **is** the frontend contract; `khawon-web/src/types/api/` mirrors it in TypeScript. Change a response model → update the TS mirror → `npm run typecheck`.
+
+**Auth:** `UserCreate` (email, username 3–50, password 6–128) · `UserOut` (id, email, username, created_at) · `Token` (access_token, bearer).
+
+**Taxonomy:** `FoodTypeOut` (id, name, + description/image_url/parent_id which are **always None** — v1 compat) · `FoodTypePopularOut` (+ restaurant_count, review_count, average_rating — derived live) · `FoodSubTypeOut` (id, name, food_type_id, dish_count, image_urls[] — pool of ≤20 member images for UI cycling) · `FoodSubTypeListResult` · `CuisineOut` · `FlavorTagOut` (`name` ← `flavor_tags.label`).
+
+**Brands & branches:**
+
+| Model | Key fields | Notes |
+|---|---|---|
+| `BrandOut` | `id`, `slug`, `name` | The brand stamp on every card. **Link with `slug`**; `id` is POST-only. |
+| `BrandListOut` | + `branch_count`, `areas[]`, `image_url`, `food_types[]`, `cuisines[]`, `display_rating`, `display_rating_source`, `display_review_count` | Browse card. `areas` ← distinct branch areas; `food_types`/`cuisines` ← union over branches. |
+| `BrandDetailOut` | `id`, `slug`, `name`, `branch_count`, `branches[]`, display trio | Brand page. `display_review_count` is the count **behind** `display_rating`, same source ([§3.5](#35-ratings-pooling--the-display-rule)). |
+| `RestaurantSummaryOut` | `id`, `name`, `area`, `address`, `image_url`, `google_place_id`, `display_rating`, `display_rating_source` | A **branch** in embedded contexts. `id` here → `/branches/*` only. |
+| `BranchResolveOut` | `id`, `chain_id`, `chain_slug`, `name`, `area`, `address`, `phone`, `google_place_id`, `image_url` | Branch → brand, so old numeric links redirect to `/restaurants/{chain_slug}`. |
+
+**Dishes:**
+
+| Model | Key fields | Notes |
+|---|---|---|
+| `BrandDishOut` | `brand`, `food_type_id`, `slug`, `name`, `description`, `image_url`, `category_raw`, `food_type`, `cuisines[]`, `flavor_tags[]`, `canonical_dish_id`, `price_min_bdt`, `price_max_bdt`, `price_varies`, `branch_count`, `brand_branch_total`, `is_sold_out_everywhere`, `average_rating`, `review_count` | **The workhorse card** ([§3.4.1](#341-brand-cards--brand_dishesbuild_brand_dishes)). `(brand.id, food_type_id, slug)` is its natural key. |
+| `BrandDishDetailOut` | + `branches[]` | Card + per-branch breakdown. |
+| `BrandBranchOut` | `restaurant_id`, `restaurant_name`, `area`, `product_id`, `price_bdt`, `is_sold_out`, `average_rating`, `review_count` | One branch serving the dish. **`product_id` is what `POST /reviews` takes.** |
+| `DishOut` | `id`, `name`, `description`, `price_bdt`, `image_url`, `is_sold_out`, `is_active`, `category_raw`, `variations[]`, `food_type`, `canonical_dish_id`, `cuisines[]`, `flavor_tags[]`, `restaurant`, `average_rating`, `review_count` | A single **product** row — dish detail and branch-menu contexts. |
+| `DishVariationOut` | `label`, `price_bdt` | |
+
+**Canonical/search:** `CanonicalDishOut` (id, name, food_type, aliases[], image_url) · `CanonicalDishMatch` (+ restaurant_count ← **brands**, dish_count, average_rating, min/max price) · `DishCompareResult` (canonical_dish, dishes[] one-per-brand, total/offset/limit, aggregates across all rows) · `DishSearchResult` (query, canonical_matches[] ≤10, dishes[], total ← **counts cards**) · `FoodDetailResult`.
+
+**Reviews:** `ReviewCreate` (`dish_id` = a **product** id, rating 1–5, comment) · `ReviewOut` (+ restaurant_id derived through the product; `comment` ← `body`; `is_verified` ← `is_verified_order`) · `RestaurantReviewCreate` (`branch_id`, rating, comment — brand comes from the path) · `RestaurantReviewOut` (+ branch_name/branch_area so pooled brand reviews can be location-tagged) · `ReviewListResult` / `RestaurantReviewListResult`.
+
+**Wrappers & misc:** `RestaurantCatalogueResult` · `BranchListResult` · `PlaceSearchResult`/`PlacePhotoOut` · `FoodImageSearchResponse`/`FoodImageSearchResult` (`search_help` carries setup guidance when HF isn't configured).
+
+## 6. Pipeline mechanics (`load_batch.py`)
+
+The five pipeline stages are covered as algorithms in [§3](#3-algorithms--methods); this is the loader that writes their output to Postgres.
+
+```
+python load_batch.py consolidated.json canonical_dishes.json "restaurants_*.json" --chains chains.json
+```
+
+Three committed phases:
+
+1. **Lookups, brands, restaurants.** Get-or-create lookup rows from the data (taxonomy tables grow on demand). Upsert brands by slug; upsert restaurants by `source_restaurant_code` (area derived from each **filename**); rebuild `restaurant_cuisines`; `delete_orphan_chains()`.
+2. **Products.** Upsert by `source_product_id` with **change detection** — a signature tuple of every written column vs. the existing row; unchanged rows skipped (reloads ~50s, 16k rows untouched). Changed rows go through a single-round-trip `unnest` bulk UPDATE. Vanished products (in DB, not in batch, belonging to this batch's restaurants) → `is_active = FALSE`. Variations and flavor links delete-and-rebuild.
+3. **Canonical dishes.** Full replace: null links → wipe → reinsert → relink by `source_product_id`.
+
+⚠️ The change-detection design is also its trap: the written-column list is hardcoded in **five places**, and missing one silently makes a column un-backfillable *or* makes the load report success while writing nothing. Both happened, in sequence, on one column. Regression tests pin it. Details: [`HANDOFF.md` §9 trap 1](HANDOFF.md).
+
+Safe to re-run anytime. User data is untouched — user-contributed branches aren't in any batch, so the deactivation sweep never reaches their products.
+
+**Consolidation note** (`consolidate_variants.py`, [§3.0](#30-the-one-function-to-understand-first-canonical_match_key) consumer #1): foodpanda is inconsistent about sizes — usually one product's `variations[]`, but for ~420 dishes each size is a *separate product row* ("Steamed Chicken Momo 5 Pcs / 6pcs / 7 Pcs…"). Left alone those would collapse into a canonical dish whose "price range" is really one restaurant's portion ladder, and could carry *different classifications* for the same dish. So it groups by `(restaurant, canonical_match_key(name))` and merges: `variations[]` gets each size as a labelled price point, classification by majority vote, description = longest, sold-out only if *all* sizes are. Grouping is strictly per-restaurant, so the looser key can't fuse different brands' dishes. 16,918 → 16,385 products.
+
+## 7. API reference
+
+**40 routes.** 🔒 = requires `Authorization: Bearer <JWT>`.
+
+**The URL rule** ([§4.4](#44-natural-keys-in-urls-serial-ids-never-leave-post-bodies)): `/restaurants/*` takes the brand **slug**; `/branches/*` takes branch-row ids; `/dishes/{id}` takes product ids; chain_id/branch_id live in POST bodies only.
 
 ### Brand surface — `routers/restaurants.py`
 | Endpoint | Returns | Notes |
 |---|---|---|
 | `GET /restaurants/?q=&offset=&limit=` | `RestaurantCatalogueResult` | Brand browse; q filters brand/branch/area/address. limit ≤ 100, default 24. |
 | `GET /restaurants/{slug}` | `BrandDetailOut` | Brand page: branches as tags, pooled display rating. |
-| `GET /restaurants/{slug}/menu` | `BrandDishOut[]` | Merged deduped brand menu (union + badge). Sorted category, then name. Unpaginated. |
-| `GET /restaurants/{slug}/dishes/{food_type_id}/{dish_slug}` | `BrandDishDetailOut` | Brand dish + per-branch breakdown. Natural-key URL. |
+| `GET /restaurants/{slug}/menu` | `BrandDishOut[]` | Merged deduped menu (union + badge), sorted category then name. Unpaginated. |
+| `GET /restaurants/{slug}/dishes/{food_type_id}/{dish_slug}` | `BrandDishDetailOut` | Brand dish + per-branch breakdown. |
 | `GET /restaurants/{slug}/reviews?offset=&limit=` | `RestaurantReviewListResult` | Location reviews pooled across the brand, branch-tagged, newest first. |
-| 🔒 `POST /restaurants/{slug}/reviews` | `RestaurantReviewOut` (201) | Body `{branch_id, rating, comment}`; branch validated to belong to the brand. Upserts (one per user per location). |
+| 🔒 `POST /restaurants/{slug}/reviews` | `RestaurantReviewOut` (201) | Body `{branch_id, rating, comment}`; branch validated to belong to the brand. Upserts. |
 | 🔒 `DELETE /restaurants/{slug}/reviews/{review_id}` | 204 | Own reviews only (403 otherwise). |
 
 ### Branch surface — `routers/branches.py` (admin/contribute)
 | Endpoint | Returns | Notes |
 |---|---|---|
-| `GET /branches/?q=&offset=&limit=` | `BranchListResult` | Location list; limit ≤ 200, default 50. |
-| `GET /branches/{branch_id}` | `BranchResolveOut` | Branch → brand resolution (old-link redirects; edit form). |
+| `GET /branches/?q=&offset=&limit=` | `BranchListResult` | limit ≤ 200, default 50. |
+| `GET /branches/{branch_id}` | `BranchResolveOut` | Branch → brand (old-link redirects; edit form). |
 | `GET /branches/{branch_id}/dishes` | `DishOut[]` | ONE location's raw menu (inspection). |
-| 🔒 `POST /branches/` | `RestaurantSummaryOut` (201) | Multipart form. Creates a **brand of one** (`user-<slug>-<hex>` codes); pipeline regroups by name later. Image via upload or Google photo → Cloudinary. |
-| 🔒 `PUT /branches/{branch_id}` | `RestaurantSummaryOut` | Edit details; image optional. |
-| 🔒 `PUT /branches/{branch_id}/photo` | `RestaurantSummaryOut` | Photo only (400 if neither source given). |
-| 🔒 `DELETE /branches/{branch_id}` | 204 | ⚠️ **Hard delete** — ORM cascade removes the branch's products and their reviews. Any signed-in user can call it currently (no role system). |
+| 🔒 `POST /branches/` | `RestaurantSummaryOut` (201) | Multipart. Creates a **brand of one** (`user-<slug>-<hex>`); pipeline regroups by name later. Image → Cloudinary. |
+| 🔒 `PUT /branches/{branch_id}` · `PUT /branches/{branch_id}/photo` | `RestaurantSummaryOut` | Edit / photo-only (400 if neither image source given). |
+| 🔒 `DELETE /branches/{branch_id}` | 204 | ⚠️ **Hard delete** — cascade removes the branch's products and their reviews. Any signed-in user can call it (no role system). |
 
 ### Dish & review surface — `routers/dishes.py`, `routers/reviews.py`
 | Endpoint | Returns | Notes |
 |---|---|---|
-| `GET /dishes/search?q=&offset=&limit=` | `DishSearchResult` | §7.3. `total` counts brand cards. |
-| `GET /dishes/compare/{canonical_dish_id}` | `DishCompareResult` | §7.4. One row per brand. |
+| `GET /dishes/search?q=&offset=&limit=` | `DishSearchResult` | [§3.4.2](#342-search--dish_detailsearch_dishes--search_canonical_dishes). `total` counts brand cards. |
+| `GET /dishes/compare/{canonical_dish_id}` | `DishCompareResult` | [§3.4.3](#343-compare--get_canonical_dish_comparison). One row per brand. |
 | `GET /dishes/{dish_id}` | `DishOut` | One product row. |
 | `GET /dishes/{dish_id}/reviews?offset=&limit=` | `ReviewListResult` | Approved only, newest first. |
-| 🔒 `POST /reviews/` | `ReviewOut` (201) | Body `{dish_id, rating, comment}` — targets one branch's product row. Upserts. |
+| 🔒 `POST /reviews/` | `ReviewOut` (201) | `{dish_id, rating, comment}` — targets one branch's product row. Upserts. |
 | 🔒 `DELETE /reviews/{review_id}` | 204 | Own reviews only. |
 
 ### Taxonomy surface — `routers/food_types.py`
 | Endpoint | Returns | Notes |
 |---|---|---|
-| `GET /food-types/` | `FoodTypeOut[]` | Alphabetical. |
-| `GET /food-types/top?limit=` | `FoodTypePopularOut[]` | Ranked by review count then rating. |
-| `GET /food-types/catalogue?q=` | `FoodTypePopularOut[]` | Full list with stats. |
-| `GET /food-types/{id}` / `{id}/detail` / `{id}/sub-types` | `FoodTypeOut` / `FoodDetailResult` / `FoodSubTypeListResult` | Detail = stats + brands serving it. |
+| `GET /food-types/` · `/top?limit=` · `/catalogue?q=` | `FoodTypeOut[]` / `FoodTypePopularOut[]` | Alphabetical / ranked by review count then rating / full list with stats. |
+| `GET /food-types/{id}` · `{id}/detail` · `{id}/sub-types` | `FoodTypeOut` / `FoodDetailResult` / `FoodSubTypeListResult` | Detail = stats + brands serving it. |
 | 🔒 `POST /food-types/` · `PUT /food-types/{id}` | `FoodTypeOut` | Name only persists (v2 dropped image/description — accepted, ignored). |
 | 🔒 `PUT /food-types/{id}/photo` | **501** | Deliberate: no image column in v2; explicit error beats a silent no-op. |
 | 🔒 `DELETE /food-types/{id}` | 204 | FK is SET NULL — products survive, unclassified. |
@@ -619,54 +994,47 @@ Sub-type tiles and canonical search cards don't store images; they serve a dedup
 ### Support surfaces
 | Endpoint | Notes |
 |---|---|
-| `POST /auth/register` · `POST /auth/login` · 🔒 `GET /auth/me` | §9. Login is OAuth2 form (`username` field accepts display name **or** email). |
-| `GET /places/search?q=&area=` · `GET /places/details?place_id=` · `GET /places/photo?photo_name=` | Google Places proxy for the contribute flow — key stays server-side; photo endpoint proxies bytes. |
-| `GET /food-images/generate?q=&limit=` (alias `/search`) · `GET /food-images/generated/{image_id}` | Hugging Face FLUX.1-schnell text-to-image for taxonomy/admin imagery; generations cached in memory 1h, served for preview, persisted to Cloudinary only when chosen. |
+| `POST /auth/register` · `POST /auth/login` · 🔒 `GET /auth/me` | [§8](#8-auth). Login is OAuth2 form; its `username` field accepts display name **or** email. |
+| `GET /places/search?q=&area=` · `/places/details?place_id=` · `/places/photo?photo_name=` | Google Places proxy for the contribute flow — key stays server-side. |
+| `GET /food-images/generate?q=&limit=` *(alias `/search`)* · `/food-images/generated/{image_id}` | HF FLUX.1-schnell text-to-image; generations cached in memory 1h, persisted to Cloudinary only when chosen. |
 | `GET /` | Health check. |
 
----
+## 8. Auth
 
-## 9. Auth
+Standard JWT bearer, deliberately minimal. Register with email + username + password (≥6); bcrypt → `password_hash`; username → `display_name` (app-side uniqueness check only). Login by display name or email → JWT `{sub: user_id, exp}`, HS256, `JWT_SECRET`, 7-day default (`JWT_EXPIRE_MINUTES=10080`). `get_current_user` decodes and loads the user for every 🔒 endpoint.
 
-Standard JWT bearer flow, deliberately minimal:
+**Not implemented** (fine pre-launch; listed so nobody assumes otherwise): no roles/admin tier — every signed-in user can hit admin endpoints **including hard branch delete**; `users.is_active` isn't checked at login; no refresh tokens, rate limiting, email verification, or password reset. ⚠️ `JWT_SECRET` falls back to a hardcoded dev default — **must** be set in production. CORS is `allow_origins=["*"]` — tighten at launch.
 
-- **Register** with email + username + password (≥6 chars). Password → bcrypt → `password_hash`. Username stored as `display_name` (app-side uniqueness check only).
-- **Login** (`OAuth2PasswordRequestForm`) by display name or email → JWT `{sub: user_id, exp}` signed HS256 with `JWT_SECRET`, default expiry 7 days (`JWT_EXPIRE_MINUTES=10080`).
-- `get_current_user` decodes the token and loads the user; every 🔒 endpoint depends on it.
-
-Not yet implemented (fine pre-launch, listed so nobody assumes otherwise): no roles/admin tier — every signed-in user can hit admin-ish endpoints including hard branch delete; `users.is_active` isn't checked at login; no refresh tokens, rate limiting, email verification, or password reset. ⚠️ `JWT_SECRET` falls back to a hardcoded dev default — **must** be set in production. CORS is `allow_origins=["*"]` — tighten at launch.
-
-## 10. External services & environment variables
+## 9. External services & environment variables
 
 | Service | Used for | Env vars |
 |---|---|---|
 | Railway Postgres | The database | `DATABASE_PUBLIC_URL` (preferred) or `DATABASE_URL`; `USE_SQLITE=1` for import checks |
-| Cloudinary | All image uploads (branch photos, food images) | `CLOUDINARY_URL` or the `CLOUDINARY_CLOUD_NAME/_API_KEY/_API_SECRET` trio |
-| Google Places API (New) | Contribute-flow lookup + photos | `GOOGLE_PLACES_API_KEY` |
+| Cloudinary | All image uploads | `CLOUDINARY_URL` or `CLOUDINARY_CLOUD_NAME`/`_API_KEY`/`_API_SECRET` |
+| Google Places (New) | Contribute-flow lookup + photos | `GOOGLE_PLACES_API_KEY` |
 | Hugging Face Inference | AI food-image generation | `HF_TOKEN` (fine-grained, Inference-Providers scope); optional `HF_IMAGE_MODEL`, `HF_INFERENCE_PROVIDER` |
 | — | Auth | `JWT_SECRET` (**required in prod**), `JWT_EXPIRE_MINUTES` |
 
-All optional integrations degrade gracefully: missing config → 503 with a human-readable setup message (surfaced in the admin UI via `search_help`), not a crash.
+Optional integrations degrade gracefully: missing config → 503 with a human-readable setup message (surfaced in the admin UI via `search_help`), not a crash.
 
-## 11. Testing
+## 10. Testing
 
-`python -m pytest tests/` — **73 tests**. The `temp_db` fixture (`tests/conftest.py`) creates and drops a throwaway `khawon_test` database *on the same Postgres server*, applies `schema.sql`, and — critically — sets `DATABASE_PUBLIC_URL` correctly so nothing touches production (§5.1). Runs take ~3 min over the Railway proxy.
+`python -m pytest tests/` — **73 tests**. The `temp_db` fixture (`tests/conftest.py`) creates and drops a throwaway `khawon_test` database on the same server, applies `schema.sql`, and — critically — sets `DATABASE_PUBLIC_URL` correctly so nothing touches production ([§5.1](#51-databasepy-34-lines)). ~3 min over the Railway proxy.
 
-The suite is mostly **regression tests encoding past bugs**: the five-list `load_batch` trap, signature drift, brand-key food-type separation, id-overlap slug behavior, rating-source pairing. If one fails you've rediscovered a bug someone already paid for — fix the code, don't edit the test.
+Mostly **regression tests encoding past bugs**: the five-list `load_batch` trap, signature drift, brand-key food-type separation, slug/id-overlap, rating-source pairing. If one fails you've rediscovered a bug someone already paid for — fix the code, don't edit the test.
 
-## 12. Known gaps & deferred work
-
-Verified 2026-07-17:
+## 11. Known gaps & deferred work
 
 | Item | State |
 |---|---|
-| **Pipeline script duplication** | Scripts live in repo *and* `strip data\code\`; nothing enforces sync. Fix: `--data-dir` flag, single repo copy. Highest-risk housekeeping item. |
-| **Google Place IDs** | `google_place_id` NULL for all 451; `match_google_places.py` output never merged. Deferred to the map feature (coords already work). |
-| **Near-me / geo** | Needs a PostGIS host + `schema_geo.sql` (§4.10). Then upgrade brand rating to nearest-branch. |
-| **Spelling unification / semantic search** | `canonical_match_key` is exact-match after a hand-built spelling map; genuine variants it misses stay split. Plan: pgvector embeddings (also powers craving/semantic search). `aliases[]` is the landing zone. |
-| **Review photos & votes** | Tables exist; no endpoints. `helpful_count` denorms not maintained. |
-| **Moderation queue** | Only needed if switching off post-moderation. |
-| **Roles/admin auth** | No role tier; see §9. Also: tighten CORS, set `JWT_SECRET`. |
-| **`restaurant_sources`** | Defined, unpopulated (§4.3). |
-| **Food-type images** | Dropped in v2; photo endpoint 501s. Restore = re-add columns via migration if the UI needs them. |
-| **Stored rating denorms** | `products.rating` etc. reserved and unmaintained (§3.3) — revisit only if read-time aggregation gets slow. |
+| **Pipeline script duplication** | `classify_batch.py` + `match_google_places.py` + `strip_restaurants.py` live **only** in `strip data\code\`, not the repo; the other four exist in **both** with nothing enforcing sync. Highest-risk housekeeping item. Fix: `--data-dir` flag, single repo copy. |
+| **Google Place IDs** | NULL for all 451; `match_google_places.py` output never merged. Deferred to the map feature (coords work). |
+| **Near-me / geo** | Needs a PostGIS host + `schema_geo.sql` ([§2.11](#211-changing-the-schema)). Then upgrade brand rating to nearest-branch. |
+| **Spelling unification / semantic search** | `canonical_match_key` is exact-match after a hand-built spelling map; genuine variants it misses stay split ([§3.3](#33-canonical-dishes-the-compare-identity)). Plan: pgvector embeddings (also powers craving/semantic search). `aliases[]` is the landing zone. |
+| **LLM classification** | `classify_batch.py` is explicitly a keyword stand-in for it. |
+| **Review photos & votes** | Tables exist; no endpoints. `helpful_count` denorms unmaintained. |
+| **Moderation queue** | Only if switching off post-moderation. |
+| **Roles/admin auth** | No role tier ([§8](#8-auth)). Also: tighten CORS, set `JWT_SECRET`. |
+| **`restaurant_sources`** | Defined, unpopulated. |
+| **Food-type images** | Dropped in v2; photo endpoint 501s. Restore = re-add columns via migration. |
+| **Stored rating denorms** | Reserved and unmaintained ([§4.3](#43-aggregate-at-read-time-store-no-derived-state)) — revisit only if read-time aggregation gets slow. |
