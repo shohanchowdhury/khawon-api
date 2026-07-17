@@ -354,7 +354,7 @@ Windows: prefix ad-hoc Python with `PYTHONIOENCODING=utf-8` (Bengali/emoji in th
 | **Google Place IDs** | `google_place_id` is **0 for all 451**. `match_google_places.py` output was never merged into the v2 restaurant JSONs. Deferred to the map feature; coords already work. |
 | **Near-me / geo** | Apply `schema_geo.sql` on a PostGIS host. Then swap brand rating from weighted-average to nearest-branch. |
 | **Fuzzy/semantic matching** | pgvector embeddings to unify spelling variants the exact key misses AND power craving/semantic search — same capability, dual use. |
-| **Flavor tags** | Table + links exist; not populated by the classifier yet. |
+| **Flavor tags** | Populated (9 tags, ~14.9k product links, verified 2026-07-17) but coarse — only 9 slugs. Richer tagging is future classifier work. |
 | **Moderation queue** | Only if switching off post-moderation. |
 | **Food-type images** | `food_types` is a bare `(id, name)` lookup — the v1 image/description columns were dropped. Photo upload endpoint returns **501**. Restore by re-adding columns if the UI needs it. |
 
