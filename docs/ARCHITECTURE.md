@@ -78,7 +78,9 @@ Why it matters: every query is a plain `GROUP BY chain_id` with **zero** `if cha
 | `product_variations` | 20,643 | | `product_flavor_tags` | 14,857 |
 | `canonical_dishes` | 1,431 | | `restaurant_cuisines` | 409 |
 | `food_types` | 28 | | `restaurant_sources` | 0 *(defined, unused)* |
-| `food_sub_types` | 111 | | `users` + all 6 review tables | 0 *(pre-launch)* |
+| `food_sub_types` | 111 ⚠️ *unlinked* | | `users` + all 6 review tables | 0 *(pre-launch)* |
+
+> ⚠️ **`food_sub_type_id` is NULL on all 16,385 products and all 1,431 canonical dishes.** The 111 sub-type rows exist, but nothing references them — the sub-type dimension is currently non-functional. This is a live bug, not a design choice: see [§3.1](#31-food-types--sub-types-classification).
 
 Derived at read time: **13,653 brand-dish cards** from 16,385 active products — ~17% of the catalogue was chain duplication, collapsed per request.
 
@@ -227,7 +229,7 @@ Four **independent dimensions**, each a nullable single FK on `products` — del
 
 Deliberately a **bare** `(id, name)` lookup. v1 had image/description/parent columns; dropped when the "rich browsable entity" role moved to `canonical_dishes`. The API still *accepts* description/image on create/update (backward compat) but doesn't persist them, and the photo endpoint returns **501**.
 
-#### `food_sub_types`
+#### `food_sub_types` ⚠️ *populated, but nothing links to it — see [§3.1](#31-food-types--sub-types-classification)*
 | Column | Type | Notes |
 |---|---|---|
 | `id` | SMALLSERIAL PK | |
@@ -296,7 +298,7 @@ Designed for multi-source provenance; `load_batch` doesn't populate it. Harmless
 | `base_price_bdt` | NUMERIC(10,2) NOT NULL CHECK ≥ 0 | The "from" price = cheapest variation. |
 | `image_url` | TEXT NULL | ~90% populated. Some foodpanda URLs carry a `?width=%s` template — patched at read time. |
 | `is_sold_out` | BOOLEAN DEFAULT FALSE | Point-in-time from the scrape. |
-| `category_id` / `cuisine_id` / `food_type_id` / `food_sub_type_id` | SMALLINT FK SET NULL | The four dimensions ([§2.3](#23-taxonomy--lookup-tables)). `food_type_id` is 100% populated and part of the brand-card key. |
+| `category_id` / `cuisine_id` / `food_type_id` / `food_sub_type_id` | SMALLINT FK SET NULL | The four dimensions ([§2.3](#23-taxonomy--lookup-tables)). Live population: `food_type_id` **100%** (and part of the brand-card key), `category_id` 100%, `cuisine_id` 86%, `food_sub_type_id` **0% ⚠️ — [live bug](#31-food-types--sub-types-classification)**. |
 | `canonical_dish_id` | INTEGER FK → canonical_dishes, SET NULL | NULL = not comparable across brands — still fully searchable. |
 | `normalized_name` | TEXT NULL *(indexed)* | **The brand-card grouping key** ([§3.4](#34-comparing-dishes-brand-cards-search-compare)), written by `load_batch` via `canonical_match_key()`. |
 | `is_active` | BOOLEAN DEFAULT TRUE | **Soft delete** ([§4.5](#45-soft-delete-for-products-union-with-badge-for-availability)). |
@@ -328,7 +330,7 @@ The cross-brand comparison identity. **Fully rebuilt every load** (links nulled 
 | `name` | TEXT NOT NULL | Display name = most common raw spelling among members. |
 | `aliases` | TEXT[] NOT NULL DEFAULT '{}' | Other observed spellings; GIN-indexed and searched. Also the landing zone for future LLM/pgvector spelling unification — fillable with no schema change. |
 | `food_type_id` | SMALLINT FK SET NULL | Part of the group key. **Sub-type is deliberately NOT in the key** — the classifier disagrees on sub_type across restaurants for the same dish (Beef Tehari: "Tehari" here, "Biryani" there) and would fragment groups. |
-| `food_sub_type_id` / `cuisine_id` / `category_id` | SMALLINT FK SET NULL | **Majority vote** across members — one stable value, so a dish doesn't flicker in/out of a filter when classifiers disagree per-restaurant. Products keep their own raw values. |
+| `food_sub_type_id` / `cuisine_id` / `category_id` | SMALLINT FK SET NULL | **Majority vote** across members — one stable value, so a dish doesn't flicker in/out of a filter when classifiers disagree per-restaurant. Products keep their own raw values. Live: `category_id` 100%, `cuisine_id` 94%, `food_sub_type_id` **0% ⚠️** (same [bug](#31-food-types--sub-types-classification); cosmetic here, since sub_type isn't in the grouping key). |
 | `image_url` | TEXT NULL | Fallback only; search serves a random image from the member pool. |
 | `created_at` | TIMESTAMPTZ | |
 
@@ -493,6 +495,24 @@ The differentiator that matters **depends on the type**, so `food_sub_types` is 
 | Set Menu | primary component | picked via `PRIMARY_PRIORITY` |
 
 **Flavor/style modifiers are NEVER a sub type** (BBQ, Spicy, Cheese, Naga, steak cuts) — those are `flavor_tags`, a multi-label dimension. Mixing them in would multiply sub types combinatorially.
+
+> ### ⚠️ LIVE BUG — sub types are classified but never linked
+>
+> The classifier assigns `sub_type` correctly, and `load_batch` creates all 111 `food_sub_types` rows. But **`food_sub_type_id` is NULL on every product and every canonical dish** (verified: 0 / 16,385 and 0 / 1,431).
+>
+> **Cause — a silent dict-key type mismatch in `load_batch.py`.** The lookup is *built* keyed by `(food_type_id: int, name)`:
+> ```python
+> sub_id = {(r.food_type_id, r.name): r.id for r in db.query(models.FoodSubType).all()}   # (12, 'Biryani/Kacchi')
+> ```
+> …but *read* keyed by `(food_type_name: str, name)` in two places — `prod_values` and the canonical insert:
+> ```python
+> "food_sub_type_id": sub_id.get((p.get("food_type"), p.get("sub_type")))   # ('Rice', 'Biryani/Kacchi') -> None
+> ```
+> `dict.get()` returns `None` on a miss rather than raising, so the load reports success while writing NULL every time. The `food_sub_types` rows still get created because `missing_sub` correctly uses `ft_id[ft]`.
+>
+> **Impact:** `GET /food-types/{id}/sub-types` returns all 111 sub types with `dish_count: 0` and `image_urls: []`. Any sub-type browse or filter is empty. **Canonical dishes are unaffected** — sub_type is deliberately not in their grouping key ([§3.3](#33-canonical-dishes-the-compare-identity)), so it's cosmetic there.
+>
+> **Fix:** map the food-type name to its id at both call sites — `sub_id.get((ft_id.get(p.get("food_type")), p.get("sub_type")))`. Requires a `load_batch` re-run to backfill. Note the change-detection trap: `food_sub_type_id` is already in both signature builders, so once the values change the rows *will* compare as changed and update — no five-list edit needed ([`HANDOFF.md` §9 trap 1](HANDOFF.md)).
 
 #### Combos get their own path
 
@@ -1036,5 +1056,6 @@ Mostly **regression tests encoding past bugs**: the five-list `load_batch` trap,
 | **Moderation queue** | Only if switching off post-moderation. |
 | **Roles/admin auth** | No role tier ([§8](#8-auth)). Also: tighten CORS, set `JWT_SECRET`. |
 | **`restaurant_sources`** | Defined, unpopulated. |
+| **Sub-type linking** ⚠️ | **Live bug** — `food_sub_type_id` NULL everywhere; sub-type browse returns `dish_count: 0` for all 111. Two-line fix + a `load_batch` re-run ([§3.1](#31-food-types--sub-types-classification)). |
 | **Food-type images** | Dropped in v2; photo endpoint 501s. Restore = re-add columns via migration. |
 | **Stored rating denorms** | Reserved and unmaintained ([§4.3](#43-aggregate-at-read-time-store-no-derived-state)) — revisit only if read-time aggregation gets slow. |
