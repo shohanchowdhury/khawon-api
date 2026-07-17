@@ -302,6 +302,12 @@ foodpanda's `chain_name` is contaminated — it named `"Rice Lab - Mirpur"` for 
 
 `_product_query` joinedloads `variations` and `flavor_tags`. SQL `LIMIT` + a joined collection truncates **wrong rows**. Current code paginates in Python or via a subquery of ids on purpose. Leave it.
 
+### 8. A partial `restaurants_glob` used to corrupt out-of-batch variations
+
+`load_batch` deletes `product_variations` / `product_flavor_tags` scoped to the current batch (`restaurant_id = ANY(batch_rest_ids)`), but the rebuild loop resolved product ids through `prod_id_by_spid`, seeded from **every** product row in the DB. So a product whose restaurant wasn't in the glob got its variations re-inserted having never been deleted → `UniqueViolation on (product_id, label)`. Hidden for months because every real load passed a glob covering all 451 restaurants; it surfaced on 2026-07-17 when `consolidated.json` was reloaded with a Dhanmondi-only glob. **Fixed** — the rebuild loop now skips products whose restaurant isn't in the batch (widening the delete would wipe restaurants the batch never loaded). Pinned by `tests/test_load_batch_partial_glob.py`.
+
+> **Related, still open:** an *empty* glob (matches zero files) is a silent no-op — `load_batch` logs `0 restaurants`, skips every product as `skipped_no_restaurant`, and reports `0 new, 0 changed, 0 unchanged` without erroring. On Git Bash the cause is usually a POSIX path (`/c/Users/...`): bash converts plain arguments but not the unexpanded `*` glob string, so Python's `glob.glob` matches nothing. Pass a **native Windows path** (`C:/Users/...`) and eyeball the `N restaurants` line. A fail-fast guard for the zero-match case is not yet in the tree.
+
 ---
 
 ## 10. Running it

@@ -91,7 +91,7 @@ One sub type **contains dozens of canonical dishes**. That's the whole relations
 
 **Why you can't compare on sub type:** comparing everything tagged `Rice/Biryani-Kacchi` across restaurants puts *Chicken Biryani* at one place next to *Beef Kacchi* at another and calls the price difference meaningful. It isn't — they're different foods. Comparison needs the *specific dish*; browsing needs the *coarse bucket*. Neither can do the other's job, so both exist.
 
-> ⚠️ **Live bug (2026-07-17):** `food_sub_type_id` is **NULL on all 16,385 products and all 1,431 canonical dishes**. The 111 sub-type rows exist but nothing links to them, so `GET /food-types/{id}/sub-types` returns every sub type with `dish_count: 0`. Cause: `load_batch.py` builds its lookup keyed `(food_type_id, name)` but reads it with `(food_type_name, name)` — the `.get()` silently returns None. Sub-type browsing is currently non-functional. Canonical dishes are unaffected.
+> **Was broken, fixed 2026-07-17.** `food_sub_type_id` used to be NULL on *every* product and canonical dish — `load_batch.py` built its lookup keyed `(food_type_id, name)` but read it with `(food_type_name, name)`, and `.get()` silently returned None, so sub-type browse showed `dish_count: 0` for all 111. The lookup is now keyed by names throughout and the DB has been reloaded: **13,712 products** and **1,184 canonical dishes** linked (the rest legitimately have no `sub_type` in the source). Worth reading if you touch the loader — [`ARCHITECTURE.md` §3.1](ARCHITECTURE.md) keeps it as a worked example of how `.get()` hides a key-shape bug.
 
 ## Q: Why do canonical dishes need to exist at all — why not just match names?
 
@@ -136,7 +136,7 @@ Numeric `/restaurants/{int}` **404s by design**. Use `slug` in URLs; ids belong 
 |---|---:|---|
 | `food_categories` | 6 | Meal role: Breakfast / Main Dish / Appetizer / Sides / Dessert / Drinks |
 | `food_types` | 28 | Coarse browse umbrellas: Rice, Curry, Pizza, Set Menu… |
-| `food_sub_types` | 111 | Per-type differentiator ⚠️ *currently unlinked — see the bug above* |
+| `food_sub_types` | 111 | Per-type differentiator (all 111 linked to products) |
 | `cuisines` | 11 | Bangladeshi, Italian… ("Asian" = pan-Asian only, not a dumping ground) |
 | `flavor_tags` | 9 | Multi-label: cheesy, smoky_bbq… (14,857 product links) |
 

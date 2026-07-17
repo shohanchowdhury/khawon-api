@@ -316,16 +316,27 @@ def main():
         cat_id = _get_or_create_lookup(db, models.FoodCategory, cat_names)
         ft_id = _get_or_create_lookup(db, models.FoodType, ft_names)
 
-        # food_sub_types are scoped under a food_type: key (food_type_id, name)
+        # food_sub_types are scoped under a food_type ('Chicken' means something
+        # different under Rice than under Fry), so the key must be composite.
+        #
+        # Key it by NAMES -- (food_type_name, sub_type_name) -- not ids. Every
+        # reader of sub_id is holding raw pipeline JSON, where food_type is a
+        # name string; keying by id meant each reader had to remember to
+        # translate first, and both of them silently didn't. sub_id.get() returns
+        # None on a miss rather than raising, so the load reported success while
+        # writing NULL to every food_sub_type_id. Only this dict needs the
+        # id<->name hop, and it does it once, here.
+        ft_name_by_id = {ft_row_id: name for name, ft_row_id in ft_id.items()}
         need_sub = {(p["food_type"], p["sub_type"]) for p in products
                     if p.get("food_type") and p.get("sub_type")}
-        sub_id = {(r.food_type_id, r.name): r.id for r in db.query(models.FoodSubType).all()}
+        sub_id = {(ft_name_by_id[r.food_type_id], r.name): r.id
+                  for r in db.query(models.FoodSubType).all()}
         missing_sub = [{"food_type_id": ft_id[ft], "name": st}
-                       for (ft, st) in need_sub if (ft_id[ft], st) not in sub_id]
+                       for (ft, st) in need_sub if (ft, st) not in sub_id]
         for row in _bulk_insert_returning(db, models.FoodSubType, missing_sub,
                                           models.FoodSubType.food_type_id,
                                           models.FoodSubType.name, models.FoodSubType.id):
-            sub_id[(row.food_type_id, row.name)] = row.id
+            sub_id[(ft_name_by_id[row.food_type_id], row.name)] = row.id
 
         # flavor_tags (slug + label; label = slug prettified)
         fl_existing = {r.slug: r.id for r in db.query(models.FlavorTag).all()}
@@ -544,6 +555,14 @@ def main():
         _ts_log("rebuilding variations + flavor tags...")
         var_rows, flav_rows = [], []
         for p in products:
+            # Must be scoped to the batch exactly as the DELETE above is:
+            # prod_id_by_spid is seeded from EVERY product row in the DB, so an
+            # out-of-batch product would have its rows re-inserted having never
+            # been deleted -> product_variations_product_id_label_key. Skip here
+            # rather than widening the DELETE, which would wipe the variations of
+            # restaurants this batch never loaded.
+            if code_to_id.get(p.get("source_restaurant_code")) is None:
+                continue
             pid = prod_id_by_spid.get(p["product_id"])
             if pid is None:
                 continue
