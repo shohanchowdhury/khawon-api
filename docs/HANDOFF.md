@@ -115,6 +115,7 @@ Khawon/
 │   └── docs/
 │       ├── HANDOFF.md          # this file
 │       ├── SCHEMA.md           # ★ ER diagrams + every column, with live-data examples
+│       ├── ONBOARDING.md       # ★ new machine: clone -> setup -> running in ~10 min
 │       └── superpowers/        # ("superpowers" = the tool that generated these; ignore the name)
 │           ├── specs/          # design docs (the WHY)
 │           └── plans/          # implementation plans (the HOW, historical)
@@ -139,12 +140,14 @@ Khawon/
 ### Running it locally (this is now the primary environment)
 
 ```powershell
-.\start-khawon.ps1          # Postgres + API + web, each in its own window
-.\start-khawon.ps1 -DbOnly  # just the database (run the servers yourself)
-.\start-khawon.ps1 -Stop    # shut the database down
+.\start-khawon.ps1                     # Postgres + API + web, each in its own window
+.\start-khawon.ps1 -Setup -Seed <file> # first time on a machine
+.\start-khawon.ps1 -DbOnly             # just the database (run the servers yourself)
+.\start-khawon.ps1 -Stop               # shut the database down
 ```
 
-The script lives at the **workspace root**, next to `khawon-api/` and `khawon-web/`.
+The script lives in **`khawon-api/`** and expects `khawon-web/` as a sibling
+directory. New machine? See [ONBOARDING.md](ONBOARDING.md).
 
 | | |
 |---|---|
