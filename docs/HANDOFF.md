@@ -141,7 +141,7 @@ Khawon/
 
 ```powershell
 .\start-khawon.ps1                     # Postgres + API + web, each in its own window
-.\start-khawon.ps1 -Setup -Seed <file> # first time on a machine
+.\start-khawon.ps1 -Setup             # first time on a machine (seed is in-repo)
 .\start-khawon.ps1 -DbOnly             # just the database (run the servers yourself)
 .\start-khawon.ps1 -Stop               # shut the database down
 ```

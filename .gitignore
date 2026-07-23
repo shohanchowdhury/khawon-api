@@ -6,5 +6,7 @@ __pycache__/
 
 .pytest_cache/
 
-# Seed dumps are shared out-of-band, never committed
+# Ad-hoc dumps stay out of git, but the committed seed is the exception --
+# it is how a new machine gets a catalogue (see docs/ONBOARDING.md).
 *.dump
+!seed/khawon-seed.dump

@@ -19,10 +19,10 @@
 
 .PARAMETER Seed
     Where the catalogue comes from. Either:
-      * a .dump file  -> restored with pg_restore (fast, ~1.3 MB, recommended)
+      * a .dump file  -> restored with pg_restore (fast, this is the default)
       * a directory   -> the pipeline's v2_output, loaded with load_batch.py
-    If omitted, -Setup looks for khawon-seed.dump next to this script, and
-    otherwise leaves you with an empty but working schema.
+    If omitted, -Setup uses seed\khawon-seed.dump, which is committed to this
+    repo -- so a fresh clone needs nothing extra.
 
 .PARAMETER DbOnly
     Start Postgres and stop there -- for running the dev servers yourself.
@@ -30,8 +30,12 @@
 .PARAMETER Stop
     Shut the Postgres cluster down. Dev servers are separate; close their windows.
 
+.PARAMETER Dump
+    Regenerate seed\khawon-seed.dump from the running database, then commit it.
+    Do this after a pipeline reload so new clones get the current catalogue.
+
 .EXAMPLE
-    .\start-khawon.ps1 -Setup -Seed .\khawon-seed.dump
+    .\start-khawon.ps1 -Setup
     .\start-khawon.ps1
     .\start-khawon.ps1 -DbOnly
     .\start-khawon.ps1 -Stop
@@ -45,7 +49,8 @@ param(
     [switch]$Setup,
     [string]$Seed,
     [switch]$DbOnly,
-    [switch]$Stop
+    [switch]$Stop,
+    [switch]$Dump
 )
 
 $ErrorActionPreference = 'Stop'
@@ -145,6 +150,25 @@ if ($Stop) {
     return
 }
 
+# ---------------------------------------------------------------- dump mode --
+# Refresh the committed seed after the catalogue changes (a pipeline reload,
+# a new area). Commit the result so new clones get the current data.
+if ($Dump) {
+    if (-not (Test-Port $PgPort)) {
+        Write-Step 'postgres' 'not running -- start it first' 'Red'
+        exit 1
+    }
+    $out = Join-Path $Api 'seed\khawon-seed.dump'
+    New-Item -ItemType Directory -Force (Split-Path $out) | Out-Null
+    Write-Step 'dump' 'writing seed\khawon-seed.dump'
+    Invoke-Native (Join-Path $PgBin 'pg_dump.exe') @(
+        '-h','localhost','-p',"$PgPort",'-U',$DbUser,'-d',$DbName,'-Fc','-Z9','-f',$out
+    ) 'pg_dump'
+    $size = [math]::Round((Get-Item $out).Length / 1MB, 2)
+    Write-Step 'dump' "$size MB -- commit it so new clones get this data" 'Green'
+    return
+}
+
 # --------------------------------------------------------------- setup mode --
 if ($Setup) {
     Write-Host "`nKhawon setup" -ForegroundColor Cyan
@@ -235,7 +259,8 @@ if ($Setup) {
 
     # 7. seed
     if (-not $Seed) {
-        $default = Join-Path $Root 'khawon-seed.dump'
+        # The catalogue ships WITH the repo, so a fresh clone needs no extra file.
+        $default = Join-Path $Api 'seed\khawon-seed.dump'
         if (Test-Path $default) { $Seed = $default }
     }
 
@@ -245,9 +270,9 @@ if ($Setup) {
         Write-Step 'data' "$rowCount restaurants already loaded, skipping seed"
     }
     elseif (-not $Seed) {
-        Write-Step 'data' 'no seed provided -- schema is empty' 'Yellow'
-        Write-Host  "          Ask for khawon-seed.dump, then:" -ForegroundColor DarkGray
-        Write-Host  "          .\start-khawon.ps1 -Setup -Seed .\khawon-seed.dump" -ForegroundColor DarkGray
+        Write-Step 'data' 'no seed found -- schema is empty' 'Yellow'
+        Write-Host  "          Expected seed\khawon-seed.dump in this repo." -ForegroundColor DarkGray
+        Write-Host  "          Restore it with: git checkout -- seed/khawon-seed.dump" -ForegroundColor DarkGray
     }
     elseif ($Seed -like '*.dump') {
         Write-Step 'data' "restoring $(Split-Path -Leaf $Seed)"

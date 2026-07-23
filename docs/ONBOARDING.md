@@ -10,8 +10,8 @@ Windows. Should take about ten minutes, most of it downloads.
    database cluster with no password at all. Just don't skip the install, since
    we use its tools.
 2. **Python 3.11+** and **Node 18+**.
-3. **`khawon-seed.dump`** — ask Shohan. It's about 1.3 MB. This is the
-   catalogue; it isn't in git.
+That's it. The catalogue ships **inside this repo** (`seed/khawon-seed.dump`,
+about 1.2 MB), so there's no data file to chase down.
 
 ## Clone both repos side by side
 
@@ -64,6 +64,21 @@ Opens two windows — the API on <http://localhost:8000> and the web app on
 | `.\start-khawon.ps1` | database + API + web |
 | `.\start-khawon.ps1 -DbOnly` | just the database, run the servers yourself |
 | `.\start-khawon.ps1 -Stop` | shut the database down |
+| `.\start-khawon.ps1 -Dump` | regenerate the committed seed (maintainers) |
+
+## Keeping the seed current
+
+`seed/khawon-seed.dump` is a snapshot, not a live feed. After a pipeline reload
+adds or changes data, refresh it and commit so everyone else picks it up:
+
+```powershell
+.\start-khawon.ps1 -Dump
+git add seed/khawon-seed.dump
+git commit -m "chore: refresh seed catalogue"
+```
+
+Ad-hoc `.dump` files elsewhere are gitignored on purpose — only this one is
+tracked.
 
 ## Things that will confuse you otherwise
 
