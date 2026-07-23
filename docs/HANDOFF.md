@@ -133,7 +133,48 @@ Khawon/
 
 ## 5. The database
 
-**20 tables.** Postgres 18 on Railway. Extensions: `pg_trgm` (fuzzy/substring name search — dish search is the core feature). **PostGIS is NOT available on Railway** — see §8.
+**20 tables.** Postgres 18. Extensions: `pg_trgm` (fuzzy/substring name search — dish search is the core feature). **PostGIS is NOT available** — see §8.
+
+### Running it locally (this is now the primary environment)
+
+```powershell
+.\start-khawon.ps1          # Postgres + API + web, each in its own window
+.\start-khawon.ps1 -DbOnly  # just the database (run the servers yourself)
+.\start-khawon.ps1 -Stop    # shut the database down
+```
+
+The script lives at the **workspace root**, next to `khawon-api/` and `khawon-web/`.
+
+| | |
+|---|---|
+| Cluster | `C:/Users/shoha/khawon-pgdata` — **dedicated**, not the system install |
+| Port | **5433** (the system PostgreSQL service is on 5432 and is unrelated) |
+| Auth | superuser `khawon`, **trust on localhost — no password** |
+| `.env` | `DATABASE_URL=postgresql://khawon@localhost:5433/khawon` |
+
+Why a separate cluster: the system install's `postgres` password is lost and it
+uses `scram-sha-256`. This sidesteps it entirely — no password, no admin rights,
+no `pg_hba.conf` edits. It is deliberately **not** a Windows service, so it does
+not survive a reboot; that is the whole reason `start-khawon.ps1` exists.
+
+`pg_ctl start` blocks its caller on Windows even with `-l`. The script launches
+it detached and polls the port instead — don't "fix" that into a `-Wait`.
+
+**Rebuilding the catalogue from scratch** (safe while `users` and the review
+tables are empty — it stops being safe the moment real reviews exist, which is
+what `migrations/` is for):
+
+```bash
+dropdb -h localhost -p 5433 -U khawon khawon && createdb -h localhost -p 5433 -U khawon khawon
+psql -h localhost -p 5433 -U khawon -d khawon -v ON_ERROR_STOP=1 -f schema.sql
+D="C:/Users/shoha/OneDrive/Desktop/strip data/code/v2_output"
+python load_batch.py "$D/consolidated.json" "$D/canonical_dishes.json" "$D/restaurants_*_restaurants.json" --chains "$D/chains.json"
+```
+
+Takes ~15s and reproduces 451 / 16,385 / 378 / 1,431 exactly. Two traps, both
+covered in §9: the restaurant JSONs are in **`v2_output/`, not its parent**, and
+a zero-match glob makes `load_batch.py` report success while loading nothing.
+**Always verify with SQL, never the loader's log.**
 
 ### Live data (verified 2026-07-16)
 
