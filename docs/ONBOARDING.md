@@ -10,6 +10,7 @@ Windows. Should take about ten minutes, most of it downloads.
    database cluster with no password at all. Just don't skip the install, since
    we use its tools.
 2. **Python 3.11+** and **Node 18+**.
+
 That's it. The catalogue ships **inside this repo** (`seed/khawon-seed.dump`,
 about 1.2 MB), so there's no data file to chase down.
 
