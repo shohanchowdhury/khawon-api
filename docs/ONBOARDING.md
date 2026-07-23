@@ -1,16 +1,35 @@
 # Getting Khawon running locally
 
-Windows. Should take about ten minutes, most of it downloads.
+About ten minutes, most of it downloads. Windows and macOS/Linux both covered —
+the two scripts do the same things, so read whichever matches your machine.
 
 ## What you need first
 
-1. **PostgreSQL 17 or 18** — <https://www.postgresql.org/download/windows/>.
-   During install it asks for a `postgres` superuser password. Set one and
-   write it down, but you will not need it here: Khawon runs its own separate
-   database cluster with no password at all. Just don't skip the install, since
-   we use its tools.
-2. **Python 3.11+** and **Node 18+**.
+**Linux (Debian / Ubuntu)** — one line, and read the note below it:
 
+```bash
+sudo apt install postgresql postgresql-contrib python3-venv python3-pip nodejs npm
+```
+
+`postgresql-contrib` is **not optional**: `pg_trgm` lives there, `schema.sql`
+requires it, and without it setup fails at the schema step. `python3-venv` is
+likewise a separate package on Debian/Ubuntu — without it `python3 -m venv`
+fails with a confusing message about `ensurepip`.
+
+Fedora: `sudo dnf install postgresql-server postgresql-contrib python3 nodejs`.
+Arch: `sudo pacman -S postgresql python nodejs npm`.
+
+You do **not** need to start or enable the system `postgresql` service — Khawon
+runs its own cluster. And do **not** run the setup script with `sudo`: Postgres
+refuses to run as root, and the cluster belongs in your home directory.
+
+**Windows** — install PostgreSQL 17 or 18 from
+<https://www.postgresql.org/download/windows/>. It asks for a `postgres`
+superuser password; set one, but you won't need it here, since Khawon runs its
+own cluster with no password. Don't skip the install, we use its CLI tools.
+Then install Python 3.11+ and Node 18+.
+
+**macOS** — `brew install postgresql@18 python@3.12 node`.
 That's it. The catalogue ships **inside this repo** (`seed/khawon-seed.dump`,
 about 1.2 MB), so there's no data file to chase down.
 
@@ -60,12 +79,16 @@ powershell -ExecutionPolicy Bypass -File .\start-khawon.ps1 -Setup -Seed C:\path
 Opens two windows — the API on <http://localhost:8000> and the web app on
 <http://localhost:5173>. Go to the web app.
 
-| Command | Does |
-|---|---|
-| `.\start-khawon.ps1` | database + API + web |
-| `.\start-khawon.ps1 -DbOnly` | just the database, run the servers yourself |
-| `.\start-khawon.ps1 -Stop` | shut the database down |
-| `.\start-khawon.ps1 -Dump` | regenerate the committed seed (maintainers) |
+| Windows | macOS / Linux | Does |
+|---|---|---|
+| `.\start-khawon.ps1` | `./start-khawon.sh` | database + API + web |
+| `-DbOnly` | `--db-only` | just the database, run the servers yourself |
+| `-Stop` | `--stop` | shut the database down |
+| `-Dump` | `--dump` | regenerate the committed seed (maintainers) |
+
+On Windows each dev server opens its own window. On macOS/Linux they run in the
+background with logs at `khawon-api/.uvicorn.log` and `khawon-web/.vite.log`;
+Ctrl+C stops both and leaves the database running.
 
 ## Keeping the seed current
 
@@ -84,7 +107,7 @@ tracked.
 ## Things that will confuse you otherwise
 
 **The database is on port 5433, not 5432.** Khawon uses its own cluster in
-`%LOCALAPPDATA%\khawon-pgdata`, deliberately separate from the system
+`%LOCALAPPDATA%\khawon-pgdata` (Windows) or `~/.local/share/khawon-pgdata` (macOS/Linux), deliberately separate from the system
 PostgreSQL service you installed. If you point pgAdmin at 5432 you'll find an
 empty database and think something broke. Connect to:
 
@@ -96,7 +119,7 @@ empty database and think something broke. Connect to:
 | User | `khawon` |
 | Password | *(leave blank — trust auth)* |
 
-**It doesn't survive a reboot.** The cluster isn't a Windows service, so after
+**It doesn't survive a reboot.** The cluster isn't registered as a service, so after
 restarting your machine you must run the script again before anything works.
 The symptom if you forget: the API starts fine and then every request fails
 with a connection error, which looks like broken code but isn't.
@@ -109,7 +132,8 @@ affected.
 ## Check it worked
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q     # Windows
+./.venv/bin/python -m pytest -q             # macOS / Linux
 ```
 
 94 tests should pass. The suite creates and drops its own `khawon_test`
