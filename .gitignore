@@ -5,3 +5,6 @@ __pycache__/
 *.db
 
 .pytest_cache/
+
+# Seed dumps are shared out-of-band, never committed
+*.dump
