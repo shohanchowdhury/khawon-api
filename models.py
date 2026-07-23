@@ -312,3 +312,27 @@ class ProductReviewVote(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     is_helpful = Column(Boolean, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# Edit history. Rows are written by DB triggers (see schema.sql), never by the
+# app -- read-only from Python. Each row is a PREVIOUS version of the review;
+# the live row is always current. Oldest row = what the review originally said.
+
+class RestaurantReviewEdit(Base):
+    __tablename__ = "restaurant_review_edits"
+    id = Column(Integer, primary_key=True)
+    review_id = Column(Integer, ForeignKey("restaurant_reviews.id", ondelete="CASCADE"), nullable=False)
+    rating = Column(SmallInteger, nullable=False)
+    body = Column(Text)
+    status = Column(Text, nullable=False)
+    superseded_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProductReviewEdit(Base):
+    __tablename__ = "product_review_edits"
+    id = Column(Integer, primary_key=True)
+    review_id = Column(Integer, ForeignKey("product_reviews.id", ondelete="CASCADE"), nullable=False)
+    rating = Column(SmallInteger, nullable=False)
+    body = Column(Text)
+    status = Column(Text, nullable=False)
+    superseded_at = Column(DateTime(timezone=True), server_default=func.now())

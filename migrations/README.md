@@ -13,11 +13,15 @@ Apply in numeric order, once per database:
     psql "$DATABASE_PUBLIC_URL" -f migrations/001_products_normalized_name.sql
 
 Every file must be idempotent (`IF NOT EXISTS`) so a re-run is a no-op.
+For triggers that means `CREATE OR REPLACE FUNCTION` plus
+`DROP TRIGGER IF EXISTS` before `CREATE TRIGGER` -- there is no
+`CREATE TRIGGER IF NOT EXISTS` in Postgres.
 When adding a column, add it to BOTH schema.sql and a new migration file.
 
 | File | What it does |
 |------|--------------|
 | `001_products_normalized_name.sql` | Adds `products.normalized_name` + index for read-time brand grouping |
+| `002_review_edit_history.sql` | Adds `restaurant_review_edits` + `product_review_edits`, and the triggers that populate them |
 
 Related: `schema_geo.sql` is NOT a migration — it is an optional add-on that
 requires PostGIS (absent on Railway) and is applied only when building the

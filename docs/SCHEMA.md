@@ -1,6 +1,6 @@
 # Khawon Database Schema
 
-**20 tables, 3 views, PostgreSQL 18.** Source of truth is [`schema.sql`](../schema.sql) — not the ORM.
+**22 tables, 3 views, PostgreSQL 18.** Source of truth is [`schema.sql`](../schema.sql) — not the ORM.
 
 Every count, name and example below was queried from the live database on 2026-07-23. Nothing here is illustrative or invented.
 
@@ -83,6 +83,8 @@ erDiagram
     product_reviews    ||--o{ product_review_photos : ""
     product_reviews    ||--o{ product_review_votes : ""
     users              ||--o{ product_review_votes : "votes"
+    restaurant_reviews ||--o{ restaurant_review_edits : "edit history"
+    product_reviews    ||--o{ product_review_edits : "edit history"
 ```
 
 **What isn't drawn: chain grouping.** It has no foreign key because it isn't stored — the API derives it per request from `products.normalized_name`.
@@ -374,8 +376,26 @@ erDiagram
         boolean is_helpful
         timestamptz created_at
     }
+    restaurant_review_edits {
+        int id PK
+        int review_id FK "CASCADE"
+        smallint rating "the PREVIOUS rating"
+        text body "the PREVIOUS body"
+        text status "the PREVIOUS status"
+        timestamptz superseded_at "when it stopped being current"
+    }
+    product_review_edits {
+        int id PK
+        int review_id FK "CASCADE"
+        smallint rating "the PREVIOUS rating"
+        text body "the PREVIOUS body"
+        text status "the PREVIOUS status"
+        timestamptz superseded_at "when it stopped being current"
+    }
     users ||--o{ restaurant_reviews : writes
     users ||--o{ product_reviews : writes
+    restaurant_reviews ||--o{ restaurant_review_edits : "trigger writes"
+    product_reviews ||--o{ product_review_edits : "trigger writes"
     restaurant_reviews ||--o{ restaurant_review_photos : ""
     restaurant_reviews ||--o{ restaurant_review_votes : ""
     product_reviews ||--o{ product_review_photos : ""
@@ -389,6 +409,16 @@ Two parallel, structurally identical stacks — one for **branches**, one for **
 - **`product_reviews`** — the differentiating feature; the thing foodpanda and Maps don't have.
 - **`*_review_votes`** — `PK (review_id, user_id)` makes double-voting structurally impossible rather than something the app must remember to check.
 
+### Edit history
+
+Reviews are editable and `UNIQUE (user_id, target)`, so an edit used to overwrite the previous rating and body in place. A review quietly rewritten after the fact is exactly the pattern that erodes trust in ratings, so the superseded version is now kept.
+
+Each `*_review_edits` row is a **previous** version — the values as they stood until `superseded_at`. The live review row is always current, so ratings, pooling and listings are unaffected.
+
+Capture is by **database trigger**, not application code. There are already two write paths (`routers/reviews.py`, `routers/restaurants.py`) and moderation will add more; a trigger can't be forgotten and also covers raw SQL. Only `rating`, `body` and `status` count as an edit — vote counters fire `UPDATE` constantly and are deliberately ignored, or every review would look edited. The comparison uses `IS DISTINCT FROM`, since `<>` against a NULL body yields NULL and would let "added a comment later" slip through unrecorded.
+
+The API surfaces this on `ReviewOut` and `RestaurantReviewOut` as `is_edited`, `edit_count`, `original_rating` and `last_edited_at`. All default to "never edited", so clients that ignore them are unaffected. `original_rating` is the **oldest** history row — that's what makes "rated 5★, now says 1★" visible to a reader.
+
 Ratings are computed on read from **approved** reviews only. The stored `rating` / `review_count` columns on `restaurants` and `products` are app-maintained aggregates.
 
 ---
@@ -401,8 +431,8 @@ The rule, applied consistently: **ownership cascades, classification nulls out.*
 |---|---|---|
 | `restaurants` | `CASCADE` | its products, cuisine links, sources and reviews all go |
 | `products` | `CASCADE` | variations, flavor links and **every review on the dish** go — use `is_active` instead |
-| `restaurant_reviews` | `CASCADE` | its photos and votes go |
-| `product_reviews` | `CASCADE` | its photos and votes go |
+| `restaurant_reviews` | `CASCADE` | its photos, votes **and edit history** go |
+| `product_reviews` | `CASCADE` | its photos, votes **and edit history** go |
 | `users` | `CASCADE` | all their reviews and votes go |
 | `food_types` | `CASCADE` | its sub-types go … |
 | `food_types` | `SET NULL` | … but products and canonical dishes survive, unclassified |

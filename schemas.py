@@ -283,6 +283,12 @@ class ReviewOut(BaseModel):
     comment: Optional[str]
     is_verified: bool = False
     created_at: datetime
+    # Edit history, surfaced as a trust signal. Defaults mean "never edited",
+    # so existing clients that ignore these fields keep working unchanged.
+    is_edited: bool = False
+    edit_count: int = 0
+    original_rating: Optional[int] = None   # what it said before the first edit
+    last_edited_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
@@ -314,6 +320,12 @@ class RestaurantReviewOut(BaseModel):
     comment: Optional[str] = None
     is_verified: bool = False
     created_at: datetime
+    # Edit history, surfaced as a trust signal. Defaults mean "never edited",
+    # so existing clients that ignore these fields keep working unchanged.
+    is_edited: bool = False
+    edit_count: int = 0
+    original_rating: Optional[int] = None   # what it said before the first edit
+    last_edited_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 

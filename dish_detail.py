@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_
 
 import models
+import review_edits
 import schemas
 from brand_dishes import build_brand_dishes, dish_slug
 from product_image_pools import pick_random_url, product_image_pools
@@ -413,8 +414,14 @@ def get_dish(db: Session, dish_id: int) -> schemas.DishOut | None:
     return enrich_dishes(db, [dish])[0]
 
 
-def review_to_out(review: models.ProductReview) -> schemas.ReviewOut:
-    """Serialize a product review with its product/restaurant/user context."""
+def review_to_out(review: models.ProductReview, edits: dict | None = None) -> schemas.ReviewOut:
+    """Serialize a product review with its product/restaurant/user context.
+
+    `edits` is this review's entry from review_edits.edit_stats(), or None when
+    it was never edited. Callers listing many reviews must batch that lookup --
+    see get_reviews_for_dish.
+    """
+    edits = edits or {}
     return schemas.ReviewOut(
         id=review.id,
         dish_id=review.product_id,
@@ -425,6 +432,10 @@ def review_to_out(review: models.ProductReview) -> schemas.ReviewOut:
         comment=review.body,
         is_verified=review.is_verified_order,
         created_at=review.created_at,
+        is_edited=bool(edits),
+        edit_count=edits.get("edit_count", 0),
+        original_rating=edits.get("original_rating"),
+        last_edited_at=edits.get("last_edited_at"),
     )
 
 
@@ -446,4 +457,5 @@ def get_reviews_for_dish(
         .limit(limit)
         .all()
     )
-    return [review_to_out(r) for r in reviews], total
+    edits = review_edits.edit_stats(db, models.ProductReviewEdit, [r.id for r in reviews])
+    return [review_to_out(r, edits.get(r.id)) for r in reviews], total

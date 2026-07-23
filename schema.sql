@@ -321,6 +321,85 @@ CREATE TABLE product_review_votes (
     PRIMARY KEY (review_id, user_id)
 );
 
+-- ---------------------------------------------------------------------------
+-- Review edit history
+--
+-- Reviews are editable and UNIQUE (user_id, target), so an edit used to
+-- overwrite the previous rating/body in place and lose it. A review quietly
+-- rewritten after the fact is exactly the pattern that erodes trust in
+-- ratings, so the superseded version is kept.
+--
+-- Each row holds a PREVIOUS version - the values as they stood until
+-- `superseded_at`. The live review row is always the current version, so every
+-- existing read (ratings, pooling, listings) is unaffected by this table.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE restaurant_review_edits (
+    id              SERIAL PRIMARY KEY,
+    review_id       INTEGER NOT NULL REFERENCES restaurant_reviews(id) ON DELETE CASCADE,
+    rating          SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    body            TEXT,
+    status          TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+    superseded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_restaurant_review_edits_review
+    ON restaurant_review_edits(review_id, superseded_at);
+
+CREATE TABLE product_review_edits (
+    id              SERIAL PRIMARY KEY,
+    review_id       INTEGER NOT NULL REFERENCES product_reviews(id) ON DELETE CASCADE,
+    rating          SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    body            TEXT,
+    status          TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+    superseded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_product_review_edits_review
+    ON product_review_edits(review_id, superseded_at);
+
+-- Capture is by TRIGGER, not application code: there are already two write
+-- paths (routers/reviews.py, routers/restaurants.py) and moderation will add
+-- more. A trigger cannot be forgotten and also covers raw SQL updates.
+--
+-- Only rating/body/status count as an edit. Vote counters (helpful_count etc.)
+-- fire UPDATE constantly and must NOT create history rows. IS DISTINCT FROM
+-- also handles NULL bodies, which plain <> would not.
+
+CREATE OR REPLACE FUNCTION log_restaurant_review_edit() RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.rating IS DISTINCT FROM NEW.rating
+       OR OLD.body IS DISTINCT FROM NEW.body
+       OR OLD.status IS DISTINCT FROM NEW.status
+    THEN
+        INSERT INTO restaurant_review_edits (review_id, rating, body, status, superseded_at)
+        VALUES (OLD.id, OLD.rating, OLD.body, OLD.status, NOW());
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_product_review_edit() RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.rating IS DISTINCT FROM NEW.rating
+       OR OLD.body IS DISTINCT FROM NEW.body
+       OR OLD.status IS DISTINCT FROM NEW.status
+    THEN
+        INSERT INTO product_review_edits (review_id, rating, body, status, superseded_at)
+        VALUES (OLD.id, OLD.rating, OLD.body, OLD.status, NOW());
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_restaurant_review_edit
+    AFTER UPDATE ON restaurant_reviews
+    FOR EACH ROW EXECUTE FUNCTION log_restaurant_review_edit();
+
+CREATE TRIGGER trg_product_review_edit
+    AFTER UPDATE ON product_reviews
+    FOR EACH ROW EXECUTE FUNCTION log_product_review_edit();
+
 -- restaurants.rating / review_count and products.rating / review_count
 -- are app aggregates from approved user reviews (updated by application logic).
 

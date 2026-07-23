@@ -10,6 +10,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 import models
+import review_edits
 import schemas
 
 
@@ -30,7 +31,12 @@ def resolve_display_rating(
     return None, 0, None
 
 
-def restaurant_review_to_out(review: models.RestaurantReview) -> schemas.RestaurantReviewOut:
+def restaurant_review_to_out(
+    review: models.RestaurantReview, edits: dict | None = None
+) -> schemas.RestaurantReviewOut:
+    """`edits` is this review's entry from review_edits.edit_stats(), or None
+    when it was never edited. Batch that lookup when listing many reviews."""
+    edits = edits or {}
     return schemas.RestaurantReviewOut(
         id=review.id,
         restaurant_id=review.restaurant_id,
@@ -41,6 +47,10 @@ def restaurant_review_to_out(review: models.RestaurantReview) -> schemas.Restaur
         comment=review.body,
         is_verified=review.is_verified_visit,
         created_at=review.created_at,
+        is_edited=bool(edits),
+        edit_count=edits.get("edit_count", 0),
+        original_rating=edits.get("original_rating"),
+        last_edited_at=edits.get("last_edited_at"),
     )
 
 
@@ -83,7 +93,8 @@ def get_reviews_for_restaurant(
         .limit(limit)
         .all()
     )
-    return [restaurant_review_to_out(r) for r in reviews], total
+    edits = review_edits.edit_stats(db, models.RestaurantReviewEdit, [r.id for r in reviews])
+    return [restaurant_review_to_out(r, edits.get(r.id)) for r in reviews], total
 
 
 def get_reviews_for_brand(
