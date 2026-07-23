@@ -114,6 +114,7 @@ Khawon/
 │   ├── tests/                  # pytest; conftest.py has the temp_db fixture (SEE §9)
 │   └── docs/
 │       ├── HANDOFF.md          # this file
+│       ├── SCHEMA.md           # ★ ER diagrams + every column, with live-data examples
 │       └── superpowers/        # ("superpowers" = the tool that generated these; ignore the name)
 │           ├── specs/          # design docs (the WHY)
 │           └── plans/          # implementation plans (the HOW, historical)
